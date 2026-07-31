@@ -112,26 +112,31 @@ print("WHAT WE FEED IN  (pre-treatment labs over time = the [visit x feature] cu
 print("=" * 78)
 raw = q(f"""
 SELECT DATE(l.LAB_COLLECTION_DTM) AS visit_date,
-       CAST(d.{NAMECOL} AS STRING) AS test,
+       COALESCE(NULLIF(TRIM(CAST(d.{NAMECOL} AS STRING)), ''),
+                CONCAT('code_', CAST(l.LAB_TEST_DK AS STRING))) AS test,
        CAST(l.RESULT_TXT AS STRING) AS value
 FROM {D}.FACT_LAB_TEST l
-JOIN {D}.DIM_LAB_TEST d USING (LAB_TEST_DK)
+LEFT JOIN {D}.DIM_LAB_TEST d USING (LAB_TEST_DK)
 WHERE l.PATIENT_DK = '{PDK}'
   AND DATE(l.LAB_COLLECTION_DTM) < DATE('{p.tx_date}')
-  AND DATE(l.LAB_COLLECTION_DTM) >= DATE_SUB(DATE('{p.tx_date}'), INTERVAL 3 YEAR)
 """)
-top_tests = raw["test"].value_counts().head(12).index.tolist()
-grid = (raw[raw["test"].isin(top_tests)]
-        .pivot_table(index="visit_date", columns="test", values="value",
-                     aggfunc="last")
-        .reindex(columns=top_tests))
-print(f"\n  rows = visits ({grid.shape[0]}), columns = features ({grid.shape[1]} shown), "
-      f"blanks = not measured that day\n")
-print(grid.to_string())
+n_visits = raw["visit_date"].nunique()
+n_tests = raw["test"].nunique()
+unnamed = raw["test"].astype(str).str.startswith("code_").mean() if len(raw) else 0
+print(f"  raw pre-treatment lab rows: {len(raw)}  |  visits: {n_visits}  |  "
+      f"distinct tests: {n_tests}  |  unnamed (no DIM match): {unnamed:.0%}")
+if not raw.empty:
+    top_tests = raw["test"].value_counts().head(12).index.tolist()
+    grid = (raw[raw["test"].isin(top_tests)]
+            .pivot_table(index="visit_date", columns="test", values="value", aggfunc="last")
+            .reindex(columns=top_tests))
+    print(f"\n  rows = visits ({grid.shape[0]}), columns = features ({grid.shape[1]} shown), "
+          f"blanks = not measured that day\n")
+    print(grid.to_string())
 
 names = tx["generic_name"].dropna().tolist() or tx["brand_name"].dropna().tolist()
 regimen = "+".join(str(x)[:18] for x in names[:3]) if names else "name_not_populated"
 print("\n" + "-" * 70)
 print("FINAL LINE:")
-print(f"single_patient | pre_tx_visits={grid.shape[0]} | distinct_tests={raw['test'].nunique()} "
-      f"| regimen={regimen}")
+print(f"single_patient | pre_tx_visits={n_visits} | distinct_tests={n_tests} "
+      f"| unnamed={unnamed:.0%} | regimen={regimen}")
