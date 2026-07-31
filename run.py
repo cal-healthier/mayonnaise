@@ -1,1 +1,1 @@
-exec(open(pull("finalize_features.py")).read())
+exec(open(pull("find_patient.py")).read())
