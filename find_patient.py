@@ -67,7 +67,7 @@ LIMIT 1
 if found.empty:
     print("no patient matched"); raise SystemExit
 p = found.iloc[0]
-PDK = int(p.PATIENT_DK)
+PDK = str(p.PATIENT_DK)   # opaque string key, not an int
 
 print("=" * 78)
 print("THE PATIENT  (this is the whole training example, for one person)")
@@ -90,7 +90,7 @@ SELECT REGEXP_EXTRACT(UPPER(CAST(m.MED_GENERIC_NAME_DESCRIPTION AS STRING)),
        MIN(DATE(t.TREATMENT_DTM)) AS first_given, COUNT(*) AS n_admin
 FROM {D}.FACT_TREATMENT_DETAIL t
 JOIN {D}.DIM_MED_NAME m USING (MED_NAME_DK)
-WHERE t.PATIENT_DK = {PDK}
+WHERE t.PATIENT_DK = '{PDK}'
   AND UPPER(CAST(m.MED_THERAPEUTIC_CLASS_DESCRIPTION AS STRING)) = 'ANTINEOPLASTICS'
 GROUP BY 1 ORDER BY 2""")
 print(tx.to_string(index=False))
@@ -105,7 +105,7 @@ SELECT DATE(l.LAB_COLLECTION_DTM) AS visit_date,
        CAST(l.RESULT_TXT AS STRING) AS value
 FROM {D}.FACT_LAB_TEST l
 JOIN {D}.DIM_LAB_TEST d USING (LAB_TEST_DK)
-WHERE l.PATIENT_DK = {PDK}
+WHERE l.PATIENT_DK = '{PDK}'
   AND DATE(l.LAB_COLLECTION_DTM) < DATE('{p.tx_date}')
   AND DATE(l.LAB_COLLECTION_DTM) >= DATE_SUB(DATE('{p.tx_date}'), INTERVAL 3 YEAR)
 """)
