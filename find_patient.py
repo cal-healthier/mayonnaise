@@ -92,15 +92,19 @@ print("\n" + "=" * 78)
 print("WHAT TREATMENT THEY GOT  (the action channel)")
 print("=" * 78)
 tx = q(f"""
-SELECT REGEXP_EXTRACT(UPPER(CAST(m.MED_GENERIC_NAME_DESCRIPTION AS STRING)),
-                      r'^([A-Z][A-Z\\-]{{2,}})') AS drug,
-       MIN(DATE(t.TREATMENT_DTM)) AS first_given, COUNT(*) AS n_admin
+SELECT CAST(m.MED_NAME_DESCRIPTION AS STRING)         AS brand_name,
+       CAST(m.MED_GENERIC_NAME_DESCRIPTION AS STRING) AS generic_name,
+       COUNT(*) AS n_admin,
+       MIN(DATE(t.TREATMENT_DTM)) AS first_given,
+       MAX(DATE(t.TREATMENT_DTM)) AS last_given
 FROM {D}.FACT_TREATMENT_DETAIL t
 JOIN {D}.DIM_MED_NAME m USING (MED_NAME_DK)
 WHERE t.PATIENT_DK = '{PDK}'
   AND UPPER(CAST(m.MED_THERAPEUTIC_CLASS_DESCRIPTION AS STRING)) = 'ANTINEOPLASTICS'
-GROUP BY 1 ORDER BY 2""")
+GROUP BY 1, 2 ORDER BY n_admin DESC""")
 print(tx.to_string(index=False))
+print("\n  (if brand/generic are blank or a redaction code, the drug name isn't recoverable")
+print("   for this patient - that's the medication-normalization problem, on the action side.)")
 
 # ---- 3. the INPUT: pre-treatment lab timeline as a [visit x feature] grid ----
 print("\n" + "=" * 78)
@@ -125,7 +129,9 @@ print(f"\n  rows = visits ({grid.shape[0]}), columns = features ({grid.shape[1]}
       f"blanks = not measured that day\n")
 print(grid.to_string())
 
+names = tx["generic_name"].dropna().tolist() or tx["brand_name"].dropna().tolist()
+regimen = "+".join(str(x)[:18] for x in names[:3]) if names else "name_not_populated"
 print("\n" + "-" * 70)
 print("FINAL LINE:")
 print(f"single_patient | pre_tx_visits={grid.shape[0]} | distinct_tests={raw['test'].nunique()} "
-      f"| regimen={'+'.join(tx['drug'].dropna().head(3))}")
+      f"| regimen={regimen}")
