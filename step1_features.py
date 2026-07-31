@@ -164,7 +164,7 @@ if missing:
 exp = {t[0]: t[2] for t in TARGETS}
 suspicious = [f[0] for f in found if closeness(f[4], exp[f[0]]) > 0.5]
 print("\n" + "-" * 70)
-print("COPY THE NEXT LINE TO CLAUDE:")
-print(f"CLAUDE_STATUS step1 | matched={len(found)}/{len(TARGETS)}"
+print("FINAL LINE:")
+print(f"step1 | matched={len(found)}/{len(TARGETS)}"
       f" | missing={','.join(missing) if missing else 'none'}"
       f" | check={','.join(suspicious) if suspicious else 'none'}")
