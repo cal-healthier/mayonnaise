@@ -44,22 +44,28 @@ labs AS (
 ),
 reg AS (
   SELECT PATIENT_DK,
+         COUNT(*) AS n_primaries,
          MIN(DATE(DATE_OF_DIAGNOSIS)) AS dx_date,
          ANY_VALUE(CAST(SITE_PRIMARY_ICD_O_3 AS STRING)) AS site,
          ANY_VALUE(CAST(SUMMARY_STAGE_2018 AS STRING)) AS stage,
          MAX(DATE(DATE_LAST_PT_CONTACT_OR_DEATH)) AS last_contact,
-         LOGICAL_OR(DATE_RECURRENCE_SUMMARY IS NOT NULL
-                    AND TRIM(CAST(DATE_RECURRENCE_SUMMARY AS STRING)) NOT IN ('', '(NONE)')) AS has_recur,
-         MAX(CAST(DATE_RECURRENCE_SUMMARY AS STRING)) AS recur_raw
+         MAX(COALESCE(
+             SAFE.PARSE_DATE('%Y-%m-%d', TRIM(CAST(DATE_RECURRENCE_SUMMARY AS STRING))),
+             SAFE.PARSE_DATE('%m/%d/%Y', TRIM(CAST(DATE_RECURRENCE_SUMMARY AS STRING))),
+             SAFE_CAST(TRIM(CAST(DATE_RECURRENCE_SUMMARY AS STRING)) AS DATE)
+         )) AS recur_date
   FROM {D}.FACT_CANCER_DATA_REPOSITORY
   WHERE DATE_OF_DIAGNOSIS IS NOT NULL
   GROUP BY 1
 )
-SELECT labs.PATIENT_DK, reg.dx_date, labs.tx_date, reg.site, reg.stage,
-       reg.has_recur, reg.recur_raw, reg.last_contact, labs.pre_lab_days
+SELECT labs.PATIENT_DK, reg.n_primaries, reg.dx_date, labs.tx_date, reg.site, reg.stage,
+       reg.recur_date, reg.last_contact, labs.pre_lab_days,
+       DATE_DIFF(reg.recur_date, labs.tx_date, DAY) AS days_tx_to_recur
 FROM labs JOIN reg USING (PATIENT_DK)
 WHERE labs.pre_lab_days BETWEEN 8 AND 25
-  AND reg.has_recur
+  AND reg.n_primaries = 1                 -- one cancer only, no cross-wiring
+  AND labs.tx_date >= reg.dx_date         -- treatment after diagnosis
+  AND reg.recur_date > labs.tx_date       -- recurrence AFTER treatment (temporal integrity)
 ORDER BY labs.PATIENT_DK
 LIMIT 1
 """)
@@ -76,8 +82,9 @@ print(f"  diagnosis date   : {p.dx_date}")
 print(f"  cancer site      : {p.site}")
 print(f"  stage            : {p.stage}")
 print(f"  TREATMENT START  : {p.tx_date}      <-- index date; we predict FROM here")
-print(f"  recurrence field : {p.recur_raw}    <-- the LABEL: cancer came back")
+print(f"  RECURRENCE date  : {p.recur_date}   <-- the LABEL, and it is AFTER treatment ({p.days_tx_to_recur} days later)")
 print(f"  last contact     : {p.last_contact}")
+print(f"  primaries        : {p.n_primaries}  (1 = single cancer, no cross-wiring)")
 print(f"  pre-tx lab days  : {p.pre_lab_days}  <-- how many visits feed the model")
 
 # ---- 2. the TREATMENT (the 'action' we condition on) ----
