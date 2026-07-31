@@ -158,3 +158,13 @@ if missing:
         for _, r in sweep.iterrows():
             print(f"     cid={int(r.cid):<9} p50={r.p50:>8.2f} {str(r.unit)[:10]:<10} "
                   f"n={int(r.n_persons):>9,}  {str(r.name)[:46]}")
+
+# ---------------------------------------------------------------- 3. one safe line
+# Structural metadata only (how many of 28 std labs mapped) - no patient values.
+exp = {t[0]: t[2] for t in TARGETS}
+suspicious = [f[0] for f in found if closeness(f[4], exp[f[0]]) > 0.5]
+print("\n" + "-" * 70)
+print("COPY THE NEXT LINE TO CLAUDE:")
+print(f"CLAUDE_STATUS step1 | matched={len(found)}/{len(TARGETS)}"
+      f" | missing={','.join(missing) if missing else 'none'}"
+      f" | check={','.join(suspicious) if suspicious else 'none'}")
