@@ -1,17 +1,13 @@
 """
-extract_cohort.py  -- the real feature extraction (v1, one cancer, capped).
+extract_cohort.py  -- the real feature extraction, SCALED (full breast cohort).
 
-Builds the training cube on the locked lane:
-  person key   = PATIENT_CLINIC_NUMBER  (dedups PATIENT_DK, bridges to OMOP)
-  lab values   = OMOP measurement.value_as_number  (numeric, our 25 concepts)
-  cancer/tx/outcome = FACT_ tables (PATIENT_DK)
+Lane: person key = PATIENT_CLINIC_NUMBER; lab values from OMOP measurement;
+cancer/tx/outcome from FACT_ tables. Cohort join happens in SQL (no IN-lists),
+so this scales to the whole cancer.
 
-Writes:
-  cohort_labels.parquet   -- one row per patient: clinic, dx, tx, label, regimen
-  cohort_features.parquet -- long: clinic, visit_date, feature, value  (the cube)
-
-Needs feature_map_final.csv (from finalize_features.py) in the working dir.
-Prints tensor shapes + one example patient. Read patient detail inside only.
+Writes cohort_labels.parquet (one row/patient) and cohort_features.parquet
+(long cube: clinic, visit_date, feature, value). Needs feature_map_final.csv.
+Read patient-level detail inside only.
 """
 import os
 import pandas as pd
@@ -21,22 +17,20 @@ C = bigquery.Client(project="mcp-acc-055-dbg-p-7e23")
 D = "`mcp-ss-data-p-5o6i`.vw_accelerate2605_core_v1"
 pd.set_option("display.width", 200); pd.set_option("display.max_columns", 30)
 
-SITE_PREFIX = "C50"     # breast; change to probe another cancer
-MAX_PATIENTS = 500      # cap for a fast, inspectable first run
+SITE_PREFIX = "C50"     # breast
 
-# ---- feature map (concept_id -> feature label + unit conversion) ----
 if not os.path.exists("feature_map_final.csv"):
     raise SystemExit("feature_map_final.csv missing -- run finalize_features.py first")
 fm = pd.read_csv("feature_map_final.csv")
 CIDS = [int(x) for x in fm["concept_id"].tolist()]
 cid2feat = dict(zip(fm.concept_id.astype(int), fm.feature))
 cid2fac = dict(zip(fm.concept_id.astype(int), fm.to_std_factor.fillna(1.0)))
-print(f"features: {len(CIDS)} concepts from feature_map_final.csv")
+CID_SQL = ",".join(str(c) for c in CIDS)
+print(f"features: {len(CIDS)} concepts")
 
-# ---- 1. cohort: one row per person, with index date and label ----
-print(f"\nbuilding cohort: site {SITE_PREFIX}*, single primary, treated, labelled ...")
-cohort = C.query(f"""
-WITH reg AS (
+# reusable cohort CTEs -> named CTE `cohort` (clinic, person_id, dx, tx_date, label)
+COHORT_CTES = f"""
+reg AS (
   SELECT PATIENT_DK, COUNT(*) AS n_prim,
          MIN(DATE(DATE_OF_DIAGNOSIS)) AS dx,
          ANY_VALUE(CAST(SITE_PRIMARY_ICD_O_3 AS STRING)) AS site,
@@ -56,85 +50,69 @@ tx AS (
 ),
 bridge AS (SELECT DISTINCT PATIENT_DK, CAST(PATIENT_CLINIC_NUMBER AS STRING) AS clinic FROM {D}.DIM_PATIENT),
 pers AS (SELECT CAST(person_source_value AS STRING) AS clinic, MIN(person_id) AS person_id FROM {D}.person GROUP BY 1),
-joined AS (
-  SELECT b.clinic, pers.person_id, r.dx, tx.tx_date, r.site,
-    CASE
-      WHEN r.recur IS NOT NULL AND r.recur > tx.tx_date THEN 1
-      WHEN (r.recur IS NULL OR r.recur <= tx.tx_date)
-           AND DATE_DIFF(r.last_contact, tx.tx_date, DAY) >= 730 THEN 0
-      ELSE NULL END AS label
-  FROM reg r
-  JOIN tx USING (PATIENT_DK)
-  JOIN bridge b USING (PATIENT_DK)
-  JOIN pers ON pers.clinic = b.clinic
-  WHERE r.n_prim = 1 AND r.site LIKE '{SITE_PREFIX}%' AND tx.tx_date >= r.dx
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY b.clinic ORDER BY tx.tx_date) = 1
+cohort AS (
+  SELECT * FROM (
+    SELECT b.clinic, pers.person_id, r.dx, tx.tx_date,
+      CASE
+        WHEN r.recur IS NOT NULL AND r.recur > tx.tx_date THEN 1
+        WHEN (r.recur IS NULL OR r.recur <= tx.tx_date)
+             AND DATE_DIFF(r.last_contact, tx.tx_date, DAY) >= 730 THEN 0
+        ELSE NULL END AS label
+    FROM reg r
+    JOIN tx USING (PATIENT_DK)
+    JOIN bridge b USING (PATIENT_DK)
+    JOIN pers ON pers.clinic = b.clinic
+    WHERE r.n_prim = 1 AND r.site LIKE '{SITE_PREFIX}%' AND tx.tx_date >= r.dx
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY b.clinic ORDER BY tx.tx_date) = 1
+  ) WHERE label IS NOT NULL
 )
-SELECT * FROM joined WHERE label IS NOT NULL
-ORDER BY clinic LIMIT {MAX_PATIENTS}
-""").to_dataframe()
+"""
 
-print(f"  cohort: {len(cohort)} patients  |  recurred={int(cohort.label.sum())}  "
-      f"clear={int((cohort.label==0).sum())}")
+# ---- 1. labels (cheap) ----
+print("\nbuilding cohort labels ...")
+cohort = C.query(f"WITH {COHORT_CTES} SELECT clinic, dx, tx_date, label FROM cohort").to_dataframe()
 cohort.to_parquet("cohort_labels.parquet")
+print(f"  cohort: {len(cohort):,} patients  |  recurred={int(cohort.label.sum())}  "
+      f"clear={int((cohort.label==0).sum())}  ({cohort.label.mean():.1%} positive)")
 
-# ---- 2. regimen per patient (normalized ingredient, for the action channel) ----
-pids = ",".join(str(int(x)) for x in cohort.person_id.tolist())
-clinics = "','".join(cohort.clinic.tolist())
-reg = C.query(f"""
-SELECT CAST(dp.PATIENT_CLINIC_NUMBER AS STRING) AS clinic,
-       LOWER(REGEXP_EXTRACT(UPPER(CAST(m.MED_GENERIC_NAME_DESCRIPTION AS STRING)),
-             r'^([A-Z0-9][A-Z0-9\\-]{{2,}})')) AS drug
-FROM {D}.FACT_TREATMENT_DETAIL t
-JOIN {D}.DIM_MED_NAME m USING (MED_NAME_DK)
-JOIN {D}.DIM_PATIENT dp USING (PATIENT_DK)
-WHERE CAST(dp.PATIENT_CLINIC_NUMBER AS STRING) IN ('{clinics}')
-  AND UPPER(CAST(m.MED_THERAPEUTIC_CLASS_DESCRIPTION AS STRING))='ANTINEOPLASTICS'
-""").to_dataframe()
-regimen = (reg.dropna().groupby("clinic")["drug"]
-           .agg(lambda s: "+".join(sorted(set(s))[:4])).rename("regimen"))
-
-# ---- 3. THE CUBE: pre-treatment lab/vital values from OMOP measurement ----
-print("\npulling measurement values (the one real-cost query) ...")
+# ---- 2. the cube: pre-tx measurement values (the one real-cost query) ----
+print("\npulling measurement values for the whole cohort (the cost query) ...")
 meas = C.query(f"""
-SELECT m.person_id, DATE(m.measurement_date) AS visit_date,
+WITH {COHORT_CTES}
+SELECT c.clinic, DATE(m.measurement_date) AS visit_date,
        m.measurement_concept_id AS cid, m.value_as_number AS value
-FROM {D}.measurement m
-WHERE m.person_id IN ({pids})
-  AND m.measurement_concept_id IN ({",".join(str(c) for c in CIDS)})
+FROM cohort c
+JOIN {D}.measurement m ON m.person_id = c.person_id
+WHERE m.measurement_concept_id IN ({CID_SQL})
   AND m.value_as_number IS NOT NULL
+  AND DATE(m.measurement_date) < c.tx_date
 """).to_dataframe()
 
-# map person_id -> clinic + tx_date, keep only pre-treatment, apply unit factor
-pmap = cohort.set_index("person_id")[["clinic", "tx_date"]]
-meas = meas.join(pmap, on="person_id")
-meas["visit_date"] = pd.to_datetime(meas["visit_date"]).dt.date
-meas = meas[meas["visit_date"] < meas["tx_date"]]
 meas["feature"] = meas["cid"].map(cid2feat)
 meas["value"] = meas["value"] * meas["cid"].map(cid2fac)
 cube = meas[["clinic", "visit_date", "feature", "value"]].dropna(subset=["feature"])
 cube.to_parquet("cohort_features.parquet")
 
-# ---- 4. shapes + coverage + one example ----
+# ---- 3. shapes + coverage + one example ----
 vis = cube.groupby("clinic")["visit_date"].nunique()
 cov = cube.groupby("feature")["clinic"].nunique().sort_values(ascending=False)
 n_with_labs = cube["clinic"].nunique()
 
-print("\n" + "=" * 72); print("THE CUBE"); print("=" * 72)
-print(f"  patients with any pre-tx labs : {n_with_labs} / {len(cohort)}")
-print(f"  pre-tx visits per patient     : median {vis.median():.0f}, "
-      f"p90 {vis.quantile(.9):.0f}, max {vis.max():.0f}")
-print(f"  long-format rows (the parquet): {len(cube):,}")
-print("\n  feature coverage (patients with >=1 measurement):")
+print("\n" + "=" * 72); print("THE SCALED CUBE"); print("=" * 72)
+print(f"  patients                      : {len(cohort):,}")
+print(f"  with any pre-tx labs          : {n_with_labs:,} ({n_with_labs/len(cohort):.0%})")
+print(f"  recurred / clear              : {int(cohort.label.sum())} / {int((cohort.label==0).sum())}")
+print(f"  pre-tx visits per patient     : median {vis.median():.0f}, p90 {vis.quantile(.9):.0f}, max {vis.max():.0f}")
+print(f"  long-format rows (parquet)    : {len(cube):,}")
+print("\n  feature coverage:")
 for f, n in cov.items():
-    print(f"     {f:<16} {n:>4} ({n/len(cohort):.0%})")
+    print(f"     {f:<16} {n:>6,} ({n/len(cohort):.0%})")
 
-# one example patient's [visit x feature] matrix (patient-level; inside only)
 ex = cube["clinic"].value_counts().index[0]
 grid = (cube[cube.clinic == ex]
         .pivot_table(index="visit_date", columns="feature", values="value", aggfunc="last"))
-print("\n  EXAMPLE patient's [visit x feature] matrix (this is one training example):")
-print(f"  shape = [{grid.shape[0]} visits x {grid.shape[1]} features], blanks = missing\n")
+print(f"\n  EXAMPLE patient's [visit x feature] matrix "
+      f"[{grid.shape[0]} x {grid.shape[1]}] (inside only):\n")
 print(grid.round(1).to_string())
 
 print("\n" + "-" * 70)
