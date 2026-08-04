@@ -1,1 +1,1 @@
-exec(open(pull("classify_v2.py")).read())
+exec(open(pull("extract_rules.py")).read())
