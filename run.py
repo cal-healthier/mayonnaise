@@ -1,1 +1,1 @@
-exec(open(pull("extract_cohort.py")).read())
+exec(open(pull("trial_criteria.py")).read())
