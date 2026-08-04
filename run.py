@@ -1,1 +1,1 @@
-exec(open(pull("trial_criteria.py")).read())
+exec(open(pull("inspect_other.py")).read())
