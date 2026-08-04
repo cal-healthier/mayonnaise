@@ -1,1 +1,1 @@
-exec(open(pull("extract_rules.py")).read())
+exec(open(pull("funnel.py")).read())
