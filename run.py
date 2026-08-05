@@ -1,1 +1,1 @@
-exec(open(pull("size_control.py")).read())
+exec(open(pull("genomics_sweep.py")).read())
