@@ -181,7 +181,8 @@ print(f"\n  at an identical alert burden the model catches "
 print("\n" + "=" * 80)
 print("WHAT CARRIES IT")
 print("=" * 80)
-Xtr, Xte, ytr, yte = train_test_split(L[fc], L["y"], test_size=.25,
+FC = usable(fc)
+Xtr, Xte, ytr, yte = train_test_split(L[FC], L["y"], test_size=.25,
                                       stratify=L["y"], random_state=0)
 mm = HistGradientBoostingClassifier(
     max_iter=300, learning_rate=0.06, max_leaf_nodes=31, min_samples_leaf=60,
@@ -189,8 +190,39 @@ mm = HistGradientBoostingClassifier(
     random_state=0).fit(Xtr, ytr)
 pi = permutation_importance(mm, Xte, yte, scoring="roc_auc", n_repeats=5,
                             random_state=0, n_jobs=-1)
-for k, v in pd.Series(pi.importances_mean, index=fc).nlargest(15).items():
+for k, v in pd.Series(pi.importances_mean, index=FC).nlargest(15).items():
     print(f"    {k:<26}{v:+.4f}")
+
+print("\n" + "=" * 80)
+print("OPERATING POINTS: flag N% of visits -> catch what share of men who")
+print("progress in the next 6 months?  (out-of-fold, PSA + labs)")
+print("=" * 80)
+print(f"  {'flag % of visits':>18}{'sensitivity':>14}{'precision':>12}"
+      f"{'alerts / 100 visits':>22}")
+for pct in (0.5, 1, 2, 5, 10, 20):
+    th = oof.quantile(1 - pct/100)
+    al = (oof >= th)
+    tpx = int((al & (L["y"] == 1)).sum()); fnx = int((~al & (L["y"] == 1)).sum())
+    fpx = int((al & (L["y"] == 0)).sum())
+    sens = tpx / max(tpx + fnx, 1); prec = tpx / max(tpx + fpx, 1)
+    mark = "  <- rule fires here" if abs(pct - rule.mean()*100) < 0.3 else ""
+    print(f"  {pct:>17.1f}%{sens:>14.1%}{prec:>12.1%}{pct:>21.1f}{mark}")
+print("\n  a man is seen ~4x a year, so flagging 10% of visits is roughly one")
+print("  extra look every 2.5 years per patient -- a modest clinical burden.")
+
+# how far ahead does an alert actually come?
+print("\n  LEAD TIME of a correct alert (months before progression):")
+prg = L[(L["y"] == 1)].copy()
+prg["score"] = oof.reindex(prg.index)
+th10 = oof.quantile(0.90)
+fired = prg[prg["score"] >= th10]
+if len(fired):
+    lead = (fired.groupby("clinic")["mo"].min())
+    endm = (E["time"] / 30.44).reindex(lead.index)
+    gap = (endm - lead).dropna()
+    for q in (25, 50, 75):
+        print(f"    p{q:<3} {gap.quantile(q/100):>5.1f} months of warning")
+    print(f"    men ever flagged before progressing: {gap.notna().sum():,}")
 
 L.to_parquet("landmarks.parquet")
 print("\nsaved landmarks.parquet")
