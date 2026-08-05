@@ -1,1 +1,1 @@
-exec(open(pull("checkpoint_tki.py")).read())
+exec(open(pull("three_checks.py")).read())
