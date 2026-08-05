@@ -1,1 +1,1 @@
-exec(open(pull("landmark_fast.py")).read())
+exec(open(pull("landmark_clean.py")).read())
