@@ -1,1 +1,1 @@
-exec(open(pull("psa_cohort.py")).read())
+exec(open(pull("psa_model.py")).read())
