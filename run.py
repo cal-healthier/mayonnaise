@@ -1,1 +1,1 @@
-exec(open(pull("pathology_probe.py")).read())
+exec(open(pull("slide_access.py")).read())
