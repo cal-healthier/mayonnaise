@@ -1,1 +1,1 @@
-exec(open(pull("slide_access.py")).read())
+exec(open(pull("msi_ici.py")).read())
