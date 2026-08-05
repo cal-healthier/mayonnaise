@@ -1,1 +1,1 @@
-exec(open(pull("four_arm_encoding.py")).read())
+exec(open(pull("target_trial.py")).read())
