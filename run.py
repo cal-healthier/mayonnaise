@@ -1,1 +1,1 @@
-exec(open(pull("checkpoint_scope.py")).read())
+exec(open(pull("checkpoint_thyroid.py")).read())
