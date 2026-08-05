@@ -1,1 +1,1 @@
-exec(open(pull("alert_or_risk.py")).read())
+exec(open(pull("glp1_scope.py")).read())
