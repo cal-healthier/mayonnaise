@@ -119,7 +119,13 @@ PSA_F = [c for c in fc if c.startswith(("psa_", "mo_", "n_psa"))]
 LAB_F = [c for c in fc if c.startswith(("Chem_", "CBC_"))]
 print(f"features: {len(PSA_F)} PSA/time + {len(LAB_F)} lab = {len(fc)}")
 
+def usable(cols):
+    """sklearn's binner fails on columns with <2 distinct values (labs drawn
+    too rarely leave slope columns almost entirely NaN)."""
+    return [c for c in cols if L[c].nunique(dropna=True) >= 2]
+
 def run(cols, name):
+    cols = usable(cols)
     X, y, g = L[cols], L["y"], L["clinic"]
     a = []
     for tr, te in GroupKFold(5).split(X, y, groups=g):
@@ -137,12 +143,40 @@ print(f"WILL HE PROGRESS IN THE NEXT {HORIZON:.0f} MONTHS?")
 print("=" * 80)
 rule = ((L["_cur"] >= 1.25 * L["_nadir"]) & (L["_cur"] >= L["_nadir"] + 2)).astype(int)
 r_auc = roc_auc_score(L["y"], rule)
+tp = int(((rule == 1) & (L["y"] == 1)).sum()); fn = int(((rule == 0) & (L["y"] == 1)).sum())
+fp = int(((rule == 1) & (L["y"] == 0)).sum()); tn = int(((rule == 0) & (L["y"] == 0)).sum())
 print(f"  {'PCWG3 rule at the landmark (current standard)':<42}AUROC {r_auc:.3f}")
+print(f"      fires at {rule.mean():.1%} of visits | sensitivity {tp/max(tp+fn,1):.1%} "
+      f"| specificity {tn/max(tn+fp,1):.1%}")
+print(f"      NB a binary rule sits at ONE point on the ROC curve, so AUROC")
+print(f"      understates it. PCWG3 defines progression that has ALREADY happened --")
+print(f"      it confirms failure rather than warning of it. That is the real point.")
 a1 = run(PSA_F, "PSA trajectory only")
 a2 = run(LAB_F, "routine labs only")
 a3 = run(fc, "PSA + labs")
-print(f"\n  labs add {a3-a1:+.3f} over PSA trajectory | model beats the rule by "
-      f"{a3-r_auc:+.3f}")
+print(f"\n  labs add {a3-a1:+.3f} over PSA trajectory")
+
+# like-for-like: let the model fire on the same fraction of visits as the rule
+Xf = L[usable(fc)]
+oof = pd.Series(index=L.index, dtype=float)
+for tr, te in GroupKFold(5).split(Xf, L["y"], groups=L["clinic"]):
+    mm_ = HistGradientBoostingClassifier(
+        max_iter=300, learning_rate=0.06, max_leaf_nodes=31, min_samples_leaf=60,
+        l2_regularization=1.0, early_stopping=True, validation_fraction=0.15,
+        random_state=0).fit(Xf.iloc[tr], L["y"].iloc[tr])
+    oof.iloc[te] = mm_.predict_proba(Xf.iloc[te])[:, 1]
+thr = oof.quantile(1 - rule.mean())
+alert = (oof >= thr).astype(int)
+tp2 = int(((alert == 1) & (L["y"] == 1)).sum()); fn2 = int(((alert == 0) & (L["y"] == 1)).sum())
+fp2 = int(((alert == 1) & (L["y"] == 0)).sum()); tn2 = int(((alert == 0) & (L["y"] == 0)).sum())
+print("\n" + "=" * 80)
+print("LIKE FOR LIKE: model set to fire at the SAME visit rate as the rule")
+print("=" * 80)
+print(f"  {'':<14}{'fires at':>10}{'sensitivity':>14}{'specificity':>14}")
+print(f"  {'PCWG3 rule':<14}{rule.mean():>10.1%}{tp/max(tp+fn,1):>14.1%}{tn/max(tn+fp,1):>14.1%}")
+print(f"  {'model':<14}{alert.mean():>10.1%}{tp2/max(tp2+fn2,1):>14.1%}{tn2/max(tn2+fp2,1):>14.1%}")
+print(f"\n  at an identical alert burden the model catches "
+      f"{tp2/max(tp,1):.1f}x as many men who progress within 6 months")
 
 print("\n" + "=" * 80)
 print("WHAT CARRIES IT")
