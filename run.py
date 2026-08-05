@@ -1,1 +1,1 @@
-exec(open(pull("ovarian_study.py")).read())
+exec(open(pull("alp_check.py")).read())
