@@ -46,9 +46,9 @@ for lbl, mask in [("marked specific BUT reason = guideline_standard", c1),
                   ("marked specific BUT reason = none_stated", c2),
                   ("marked NOT specific BUT reason is inherently specific", c3)]:
     print(f"  {lbl:<52}{int(mask.sum()):>5}  ({mask.mean():>5.0%})")
-contra = c1 | c2 | c3
-print(f"\n  any contradiction: {int(contra.sum()):,} of {len(d):,} "
-      f"({contra.mean():.0%})")
+contra_mask = c1 | c2 | c3
+print(f"\n  any contradiction: {int(contra_mask.sum()):,} of {len(d):,} "
+      f"({contra_mask.mean():.0%})")
 print("  a low rate means the model is at least internally coherent; a high one")
 print("  means the 'specific' flag is decorative and cannot be trusted.")
 
@@ -70,7 +70,7 @@ def _cat(r):
     return "wrong" if t else "unknown"
 X["dcat"] = X.apply(_cat, axis=1)
 MISS = X[(X["dec"]) & (X["dcat"] == "wrong")].to_dict("records")
-CON = d[contra | noev].to_dict("records")
+CON = d[contra_mask | noev].to_dict("records")
 random.shuffle(MISS); random.shuffle(CON)
 print(f"\n  queued: {len(MISS)} wrong-drug cases, {len(CON)} contradictory cases")
 
@@ -124,5 +124,5 @@ def contra(full=False):
 print("\n  call  miss()  in a new cell to start reading.")
 print("\n" + "-" * 74)
 print("FINAL LINE:")
-print(f"miss_audit | decision_notes={len(d)} | contradiction={contra.mean():.0%} "
+print(f"miss_audit | decision_notes={len(d)} | contradiction={contra_mask.mean():.0%} "
       f"| specific_no_evidence={noev.mean():.0%} | wrong_drug_cases={len(MISS)}")
