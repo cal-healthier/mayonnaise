@@ -1,1 +1,1 @@
-exec(open(pull("onc_text_check.py")).read())
+exec(open(pull("decision_notes.py")).read())
