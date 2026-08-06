@@ -1,1 +1,1 @@
-exec(open(pull("rules_rerun.py")).read())
+exec(open(pull("rules_rerun_cheap.py")).read())
