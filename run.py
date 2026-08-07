@@ -1,1 +1,1 @@
-exec(open(pull("radiology_concord.py")).read())
+exec(open(pull("rad_controls.py")).read())
