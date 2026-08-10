@@ -1,1 +1,1 @@
-exec(open(pull("hf_redirect.py")).read())
+exec(open(pull("get_weights.py")).read())
