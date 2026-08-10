@@ -1,1 +1,1 @@
-exec(open(pull("gpu_retry.py")).read())
+exec(open(pull("gpu_job.py")).read())
