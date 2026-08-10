@@ -1,1 +1,1 @@
-exec(open(pull("text_vs_numbers2.py")).read())
+exec(open(pull("find_gpu.py")).read())
