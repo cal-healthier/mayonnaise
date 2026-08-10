@@ -1,1 +1,1 @@
-exec(open(pull("embed_probe.py")).read())
+exec(open(pull("embed_diag.py")).read())
