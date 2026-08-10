@@ -1,1 +1,1 @@
-exec(open(pull("token_check.py")).read())
+exec(open(pull("embed_probe.py")).read())
