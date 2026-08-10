@@ -1,1 +1,1 @@
-exec(open(pull("embed_diag.py")).read())
+exec(open(pull("local_model_check.py")).read())
