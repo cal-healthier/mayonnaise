@@ -1,1 +1,1 @@
-exec(open(pull("get_weights.py")).read())
+exec(open(pull("embed_eval.py")).read())
