@@ -1,1 +1,1 @@
-exec(open(pull("what_is_it_reading.py")).read())
+exec(open(pull("is_it_ecog.py")).read())
