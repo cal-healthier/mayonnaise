@@ -1,1 +1,1 @@
-exec(open(pull("rad_controls.py")).read())
+exec(open(pull("token_check.py")).read())
