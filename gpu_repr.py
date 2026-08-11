@@ -59,10 +59,29 @@ def sh(cmd, n=12, quiet=False, t=1800):
 # ovt_notes.parquet kept only (clinic, txt) and the outer SELECT had no
 # ORDER BY, so row order cannot be trusted to recover recency. Re-pull with
 # the rank made explicit.
+def slim(N):
+    """Write the GPU's copy with ONLY plain numpy dtypes.
+
+    to_dataframe() returns note_date as BigQuery's 'dbdate' extension type.
+    db-dtypes ships with google-cloud-bigquery so the bastion reads it fine,
+    but the GPU venv has only torch/sentence-transformers/pandas/pyarrow and
+    dies with "data type 'dbdate' not understood" on read_parquet. Never send
+    an extension dtype across; the remote does not need the date anyway."""
+    G = pd.DataFrame({
+        "clinic":      N["clinic"].astype(str),
+        "txt":         N["txt"].astype(str),
+        "rn":          pd.to_numeric(N["rn"]).fillna(0).astype("int64"),
+        "days_before": pd.to_numeric(N["days_before"]).fillna(0).astype("int64"),
+    })
+    G.to_parquet("ovt_notes_gpu.parquet")
+    return G
+
+
 def notes():
     if os.path.exists("ovt_notes2.parquet"):
         N = pd.read_parquet("ovt_notes2.parquet")
         print(f"  cached: {len(N):,} notes with rank")
+        slim(N)
         return N
     E = pd.read_parquet("ov_label.parquet")
     cv = pd.read_parquet("ov_ca125.parquet")
@@ -90,7 +109,10 @@ def notes():
     job = C.query(sql, job_config=bigquery.QueryJobConfig(dry_run=True))
     print(f"  re-pulling notes with rank + date ({job.total_bytes_processed/1e9:.1f} GB)")
     N = C.query(sql).to_dataframe()
+    if "note_date" in N.columns:
+        N["note_date"] = pd.to_datetime(N["note_date"].astype("datetime64[ns]"))
     N.to_parquet("ovt_notes2.parquet")
+    slim(N)
     print(f"  {len(N):,} notes, {N['clinic'].nunique():,} women")
     return N
 
@@ -142,7 +164,7 @@ REMOTE = r'''
 import os, re, time, pandas as pd, torch
 from sentence_transformers import SentenceTransformer
 print("cuda:", torch.cuda.is_available(), flush=True)
-N = pd.read_parquet("ovt_notes2.parquet")
+N = pd.read_parquet("ovt_notes_gpu.parquet")
 NUMS = re.compile(r"[0-9]+(\.[0-9]+)?")
 N["nonum"] = N["txt"].str.replace(NUMS, " ", regex=True)
 print(f"{len(N):,} notes", flush=True)
@@ -206,7 +228,7 @@ else:
                      2, quiet=True)
         if "YES" not in have:
             sh(f"{SCP} -r models/pubmedbert {USER}@{ip}:~/models/ 2>&1", 2, quiet=True, t=1800)
-        sh(f"{SCP} ovt_notes2.parquet {USER}@{ip}:~/ 2>&1", 2, quiet=True, t=900)
+        sh(f"{SCP} ovt_notes_gpu.parquet {USER}@{ip}:~/ 2>&1", 2, quiet=True, t=900)
         print("    sent")
 
         print("\n6. embedding per-note at 256 and 512 tokens")
