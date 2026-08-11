@@ -1,1 +1,2 @@
-exec(open(pull("what_carries_it.py")).read())
+exec(open(pull("gpu_strip.py")).read())
+exec(open(pull("strip_test.py")).read())
