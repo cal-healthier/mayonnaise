@@ -20,23 +20,29 @@ The obvious suspect is what we do to the text before and after encoding:
                before treatment should matter more than one from 11 months
                earlier.
 
-Averaging over long documents has already burned us three separate times in
-this project (sentence similarity, embedding triage, MLM surprisal). Each
-time the aggregate hid the signal.
+Averaging over long documents has already burned us three times in this
+project (sentence similarity, embedding triage, MLM surprisal). Each time the
+aggregate hid the signal.
 
-This job re-embeds the ovarian notes on the A100 keeping PER-NOTE vectors --
-no pooling at all -- at both 256 and 512 tokens. repr_test.py then tries
-different ways of collapsing them to a patient and measures which matters.
+This embeds PER-NOTE vectors -- no pooling at all -- for BOTH cohorts at BOTH
+256 and 512 tokens, so repr_test.py can try different collapses and so the
+prostate confirmatory run is unblocked without another boot.
 
-Only pubmedbert, since the bake-off showed the choice is immaterial.
+THE BOX IS LEFT RUNNING. Two jobs already died paying a full boot cycle to
+learn nothing (sshd not up yet, then a dtype error). Stopping between steps
+buys pennies and costs round trips. Call stop_all() when the session ends.
 """
-import base64, hashlib, json, os, re, ssl, subprocess, time, urllib.request
+import base64, json, os, ssl, subprocess, time, urllib.request
 import pandas as pd
 from google.cloud import bigquery
 
-COHORT = "ovarian"
-WREPO = "cal-healthier/mayo-weights"
-CTX = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
+KEEP_ALIVE = True
+SEQ = (256, 512)
+COHORTS = {
+    "ovarian":  ("ov_label.parquet",       "ov_ca125.parquet"),
+    "prostate": ("psa_progression.parquet", "psa_values.parquet"),
+}
+
 PROJ = os.environ.get("GOOGLE_CLOUD_PROJECT", "mcp-acc-055-dbg-p-7e23")
 USER = "calder_healthier"
 KEY = os.path.expanduser("~/.ssh/google_compute_engine")
@@ -55,37 +61,39 @@ def sh(cmd, n=12, quiet=False, t=1800):
     return r.returncode, out
 
 
-# ------------------------------------------------- notes WITH rank and date
-# ovt_notes.parquet kept only (clinic, txt) and the outer SELECT had no
-# ORDER BY, so row order cannot be trusted to recover recency. Re-pull with
-# the rank made explicit.
-def slim(N):
-    """Write the GPU's copy with ONLY plain numpy dtypes.
+def slim(N, tag):
+    """The GPU's copy, plain numpy dtypes ONLY.
 
     to_dataframe() returns note_date as BigQuery's 'dbdate' extension type.
-    db-dtypes ships with google-cloud-bigquery so the bastion reads it fine,
+    db-dtypes ships with google-cloud-bigquery so the bastion reads it back,
     but the GPU venv has only torch/sentence-transformers/pandas/pyarrow and
-    dies with "data type 'dbdate' not understood" on read_parquet. Never send
-    an extension dtype across; the remote does not need the date anyway."""
+    dies with "data type 'dbdate' not understood". The remote needs the rank
+    and the day offset, never the date itself."""
     G = pd.DataFrame({
         "clinic":      N["clinic"].astype(str),
         "txt":         N["txt"].astype(str),
         "rn":          pd.to_numeric(N["rn"]).fillna(0).astype("int64"),
         "days_before": pd.to_numeric(N["days_before"]).fillna(0).astype("int64"),
     })
-    G.to_parquet("ovt_notes_gpu.parquet")
+    G.to_parquet(f"notes_gpu_{tag}.parquet")
     return G
 
 
-def notes():
-    if os.path.exists("ovt_notes2.parquet"):
-        N = pd.read_parquet("ovt_notes2.parquet")
-        print(f"  cached: {len(N):,} notes with rank")
-        slim(N)
+def notes(tag):
+    """pre-treatment notes with rank and days-before made explicit.
+
+    The original pulls kept only (clinic, txt) and had no outer ORDER BY, so
+    recency cannot be recovered from them at all."""
+    cache = f"notes2_{tag}.parquet"
+    if os.path.exists(cache):
+        N = pd.read_parquet(cache)
+        print(f"  {tag:<9} cached: {len(N):,} notes, {N['clinic'].nunique():,} patients")
+        slim(N, tag)
         return N
-    E = pd.read_parquet("ov_label.parquet")
-    cv = pd.read_parquet("ov_ca125.parquet")
-    E["tx_date"] = pd.to_datetime(cv.groupby("clinic")["tx_date"].first().reindex(E.index))
+    lab, mark = COHORTS[tag]
+    E = pd.read_parquet(lab)
+    tx = pd.read_parquet(mark).groupby("clinic")["tx_date"].first()
+    E["tx_date"] = pd.to_datetime(tx.reindex(E.index))
     E = E.dropna(subset=["tx_date"])
     E = E[(E["prog"] == 1) | (E["time"] >= 365)]
     rows = ",".join(f"('{c}',DATE '{d.date()}')"
@@ -96,7 +104,6 @@ def notes():
            JOIN {D}.person pe ON CAST(pe.person_source_value AS STRING)=c.clinic)
     SELECT pk.clinic,
            SUBSTR(CAST(n.note_text AS STRING),1,6000) AS txt,
-           DATE(n.note_date) AS note_date,
            DATE_DIFF(pk.tx, DATE(n.note_date), DAY) AS days_before,
            ROW_NUMBER() OVER (PARTITION BY pk.clinic ORDER BY n.note_date DESC) AS rn
     FROM pk JOIN {D}.note n ON n.person_id=pk.person_id
@@ -107,21 +114,13 @@ def notes():
     QUALIFY rn <= 6
     """
     job = C.query(sql, job_config=bigquery.QueryJobConfig(dry_run=True))
-    print(f"  re-pulling notes with rank + date ({job.total_bytes_processed/1e9:.1f} GB)")
+    print(f"  {tag:<9} pulling ({job.total_bytes_processed/1e9:.0f} GB, "
+          f"{len(E):,} patients) ...")
     N = C.query(sql).to_dataframe()
-    if "note_date" in N.columns:
-        N["note_date"] = pd.to_datetime(N["note_date"].astype("datetime64[ns]"))
-    N.to_parquet("ovt_notes2.parquet")
-    slim(N)
-    print(f"  {len(N):,} notes, {N['clinic'].nunique():,} women")
+    N.to_parquet(cache)
+    slim(N, tag)
+    print(f"  {tag:<9} {len(N):,} notes, {N['clinic'].nunique():,} patients")
     return N
-
-
-# ---------------------------------------------------------------- gpu plumbing
-def api(path):
-    url = f"https://api.github.com/repos/{WREPO}/{path}?_={int(time.time())}"
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
-    return json.load(urllib.request.urlopen(req, timeout=180, context=CTX))
 
 
 def grab():
@@ -163,51 +162,62 @@ def stop_all():
 REMOTE = r'''
 import os, re, time, pandas as pd, torch
 from sentence_transformers import SentenceTransformer
-print("cuda:", torch.cuda.is_available(), flush=True)
-N = pd.read_parquet("ovt_notes_gpu.parquet")
+print("cuda:", torch.cuda.is_available(),
+      torch.cuda.get_device_name(0) if torch.cuda.is_available() else "", flush=True)
 NUMS = re.compile(r"[0-9]+(\.[0-9]+)?")
-N["nonum"] = N["txt"].str.replace(NUMS, " ", regex=True)
-print(f"{len(N):,} notes", flush=True)
-for L in (256, 512):
-    out = f"rn_emb_{L}.parquet"
-    if os.path.exists(out):
-        print(f"  {L}: cached", flush=True); continue
-    m = SentenceTransformer("models/pubmedbert", device="cuda")
-    m.max_seq_length = L
-    t0 = time.time()
-    V = m.encode(N["nonum"].tolist(), batch_size=128,
-                 normalize_embeddings=True, show_progress_bar=False)
-    o = pd.DataFrame(V)
-    o.columns = [str(c) for c in o.columns]
-    o["clinic"] = N["clinic"].values
-    o["rn"] = N["rn"].values
-    o["days_before"] = N["days_before"].values
-    o.to_parquet(out)          # PER-NOTE, deliberately not pooled
-    dt = time.time() - t0
-    print(f"  {L} tokens: {len(N):,} notes in {dt:.1f}s ({len(N)/dt:.0f}/sec)", flush=True)
+for L in %s:
+    m = None
+    for tag in %s:
+        out = f"rn_emb_{tag}_{L}.parquet"
+        if os.path.exists(out):
+            print(f"  {tag} @ {L}: cached", flush=True); continue
+        src = f"notes_gpu_{tag}.parquet"
+        if not os.path.exists(src):
+            print(f"  {tag}: {src} not here, skipping", flush=True); continue
+        N = pd.read_parquet(src)
+        N["nonum"] = N["txt"].str.replace(NUMS, " ", regex=True)
+        if m is None:
+            m = SentenceTransformer("models/pubmedbert", device="cuda")
+            m.max_seq_length = L
+        t0 = time.time()
+        V = m.encode(N["nonum"].tolist(), batch_size=128,
+                     normalize_embeddings=True, show_progress_bar=False)
+        o = pd.DataFrame(V)
+        o.columns = [str(c) for c in o.columns]
+        o["clinic"] = N["clinic"].values
+        o["rn"] = N["rn"].values
+        o["days_before"] = N["days_before"].values
+        o.to_parquet(out)          # PER-NOTE, deliberately not pooled
+        dt = time.time() - t0
+        print(f"  {tag} @ {L}: {len(N):,} notes in {dt:.1f}s "
+              f"({len(N)/dt:.0f}/sec)", flush=True)
     del m; torch.cuda.empty_cache()
 print("done")
-'''
+''' % (repr(list(SEQ)), repr(list(COHORTS)))
 
 
 print("=" * 78)
-print("PER-NOTE EMBEDDING  --  finding the real bottleneck")
+print("PER-NOTE EMBEDDING  --  both cohorts, both truncations")
 print("=" * 78)
 
-print("\n1. notes with rank and date")
-N = notes()
+print("\n1. notes with rank and days-before")
+for tag in COHORTS:
+    try:
+        notes(tag)
+    except Exception as e:
+        print(f"  {tag:<9} FAILED: {type(e).__name__}: {str(e)[:150]}")
 
 print("\n2. starting a GPU")
 ip = grab()
+ok = False
 if not ip:
-    print("  no capacity. try again shortly.")
+    print("  no capacity in either zone. try again in a few minutes.")
 else:
     SSH = f"ssh -i {KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=25 {USER}@{ip}"
     SCP = f"scp -i {KEY} -o StrictHostKeyChecking=no"
     print("\n3. waiting for sshd")
     if not wait_ssh(ip):
-        print("  unreachable. stopping.")
-        stop_all()
+        print("  unreachable.")
     else:
         print("\n4. environment")
         code, out = sh(f"{SSH} '{VP}/python -c \"import torch,sentence_transformers;"
@@ -227,27 +237,40 @@ else:
         _, have = sh(f"{SSH} 'test -f ~/models/pubmedbert/model.safetensors && echo YES'",
                      2, quiet=True)
         if "YES" not in have:
-            sh(f"{SCP} -r models/pubmedbert {USER}@{ip}:~/models/ 2>&1", 2, quiet=True, t=1800)
-        sh(f"{SCP} ovt_notes_gpu.parquet {USER}@{ip}:~/ 2>&1", 2, quiet=True, t=900)
-        print("    sent")
+            sh(f"{SCP} -r models/pubmedbert {USER}@{ip}:~/models/ 2>&1", 2,
+               quiet=True, t=1800)
+        for tag in COHORTS:
+            f = f"notes_gpu_{tag}.parquet"
+            if os.path.exists(f):
+                sh(f"{SCP} {f} {USER}@{ip}:~/ 2>&1", 2, quiet=True, t=1800)
+                print(f"    {f} sent")
 
-        print("\n6. embedding per-note at 256 and 512 tokens")
+        print("\n6. embedding per-note, all cohorts x all truncations")
         open("_remote_repr.py", "w").write(REMOTE)
         sh(f"{SCP} _remote_repr.py {USER}@{ip}:~/ 2>&1", 2, quiet=True)
-        sh(f"{SSH} 'cd ~ && {VP}/python _remote_repr.py' 2>&1", 16, t=3600)
+        sh(f"{SSH} 'cd ~ && {VP}/python _remote_repr.py' 2>&1", 24, t=7200)
 
         print("\n7. copying back")
-        got = 0
-        for L in (256, 512):
-            c, _o = sh(f"{SCP} {USER}@{ip}:~/rn_emb_{L}.parquet . 2>&1", 2,
-                       quiet=True, t=900)
-            got += (c == 0 and os.path.exists(f"rn_emb_{L}.parquet"))
-        print(f"    {got}/2 retrieved")
+        got = []
+        for tag in COHORTS:
+            for L in SEQ:
+                f = f"rn_emb_{tag}_{L}.parquet"
+                c, _o = sh(f"{SCP} {USER}@{ip}:~/{f} . 2>&1", 2, quiet=True, t=1800)
+                if c == 0 and os.path.exists(f):
+                    got.append(f)
+        print(f"    {len(got)}/{len(COHORTS)*len(SEQ)} retrieved: {', '.join(got)}")
+        ok = len(got) > 0
 
-        print("\n8. stopping the GPU")
-        stop_all()
+        if KEEP_ALIVE:
+            print(f"""
+  GPU LEFT RUNNING at {ip}. More work this session costs nothing extra and
+  saves a 2-minute boot each time. When you are done for the day:
+
+      stop_all()""")
+        else:
+            stop_all()
 
 print("\n" + "-" * 74)
 print("FINAL LINE:")
-print(f"gpu_repr | per_note=256,512 | ready={os.path.exists('rn_emb_256.parquet')}"
-      f",{os.path.exists('rn_emb_512.parquet')} | gpu=stopped")
+print(f"gpu_repr | cohorts={','.join(COHORTS)} | seq={','.join(map(str,SEQ))} "
+      f"| ok={ok} | gpu={'RUNNING' if (ip and KEEP_ALIVE) else 'stopped'}")

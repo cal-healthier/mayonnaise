@@ -102,8 +102,9 @@ def poolings(V):
 y = E["y"]
 results = {}
 
+COHORT = "ovarian"
 for L in (256, 512):
-    f = f"rn_emb_{L}.parquet"
+    f = f"rn_emb_{COHORT}_{L}.parquet"
     if not os.path.exists(f):
         print(f"\n{f} missing -- run gpu_repr.py first")
         continue
