@@ -1,3 +1,2 @@
-exec(open(pull("gpu_bakeoff.py")).read())
-exec(open(pull("bakeoff.py")).read())
-exec(open(pull("audit.py")).read())
+exec(open(pull("gpu_repr.py")).read())
+exec(open(pull("repr_test.py")).read())
