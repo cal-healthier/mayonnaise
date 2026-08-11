@@ -1,1 +1,1 @@
-exec(open(pull("is_it_ecog.py")).read())
+exec(open(pull("ovarian_text.py")).read())
