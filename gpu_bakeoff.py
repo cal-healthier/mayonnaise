@@ -124,8 +124,6 @@ def grab(retry=1, wait=60):
                            quiet=True)
                 ip = ip.strip().splitlines()[-1]
                 print(f"  {gpu} at {ip}  (${cost:.2f}/hr -- stopped automatically below)")
-                print("  waiting for sshd ...")
-                time.sleep(25)
                 return ip
             if why == "PERMISSION DENIED":
                 return None
@@ -133,6 +131,29 @@ def grab(retry=1, wait=60):
             print(f"  both pools empty, waiting {wait}s ({attempt+1}/{retry})")
             time.sleep(wait)
     return None
+
+
+def wait_ssh(ip, timeout=420):
+    """A fresh boot needs well over 25s before sshd answers. Poll, do not guess.
+
+    The first version slept 25s and then ran the environment check; ssh came
+    back "Connection refused", the check read that as "torch cannot see the
+    card" and the safety path stopped a perfectly good A100."""
+    t0 = time.time()
+    n = 0
+    while time.time() - t0 < timeout:
+        code, _ = sh(f"ssh -i {KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
+                     f"-o BatchMode=yes {USER}@{ip} 'echo up' 2>&1",
+                     quiet=True, t=40)
+        if code == 0:
+            print(f"    sshd answered after {time.time()-t0:.0f}s")
+            return True
+        n += 1
+        if n % 3 == 1:
+            print(f"    still booting ({time.time()-t0:.0f}s) ...")
+        time.sleep(10)
+    print(f"    sshd never came up in {timeout}s")
+    return False
 
 
 def stop_all():
@@ -191,7 +212,13 @@ def go():
     SSH = f"ssh -i {KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=25 {USER}@{ip}"
     SCP = f"scp -i {KEY} -o StrictHostKeyChecking=no"
 
-    print("\n3. environment on the box")
+    print("\n3. waiting for sshd")
+    if not wait_ssh(ip):
+        print("  cannot reach the box. stopping it so it does not bill.")
+        stop_all()
+        return False
+
+    print("\n4. environment on the box")
     code, out = sh(f"{SSH} '{VP}/python -c \"import torch,sentence_transformers;"
                    f"print(torch.cuda.is_available())\"' 2>&1", 3, quiet=True)
     if code != 0 or "True" not in out:
@@ -211,7 +238,7 @@ def go():
     else:
         print("    venv already good, torch sees the card")
 
-    print("\n4. sending models and notes across")
+    print("\n5. sending models and notes across")
     sh(f"{SSH} 'mkdir -p ~/models'", 2, quiet=True)
     for name, _ in MODELS:
         _, have = sh(f"{SSH} 'test -f ~/models/{name}/model.safetensors && echo YES'",
@@ -225,12 +252,12 @@ def go():
     sh(f"{SCP} {NOTES} {USER}@{ip}:~/ 2>&1", 2, quiet=True, t=900)
     print(f"    {NOTES} copied")
 
-    print("\n5. embedding on the card")
+    print("\n6. embedding on the card")
     open("_remote_bakeoff.py", "w").write(REMOTE)
     sh(f"{SCP} _remote_bakeoff.py {USER}@{ip}:~/ 2>&1", 2, quiet=True)
     code, out = sh(f"{SSH} 'cd ~ && {VP}/python _remote_bakeoff.py' 2>&1", 20, t=3600)
 
-    print("\n6. copying embeddings back")
+    print("\n7. copying embeddings back")
     got = 0
     for name, _ in MODELS:
         c, _o = sh(f"{SCP} {USER}@{ip}:~/bo_emb_{name}.parquet . 2>&1", 2,
@@ -238,7 +265,7 @@ def go():
         got += (c == 0 and os.path.exists(f"bo_emb_{name}.parquet"))
     print(f"    {got}/{len(MODELS)} embedding files retrieved")
 
-    print("\n7. stopping the GPU before any scoring")
+    print("\n8. stopping the GPU before any scoring")
     stop_all()
 
     if got < len(MODELS):
