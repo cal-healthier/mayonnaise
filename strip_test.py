@@ -1,37 +1,58 @@
 """
-strip_test.py -- does anything survive once the header is gone?
+strip_test.py -- the deflationary tests, both of them.
 
-The deflationary hypothesis, stated so it can be killed:
+The stripping output changed what needs testing. Two things it revealed:
 
-    the text arm works because the MIX OF DOCUMENT TYPES in a patient's
-    record encodes where they are in the treatment pathway. Oncology phone
-    messages mean active chemo; post-op and nutrition notes mean a surgical
-    episode. That is prognostic, but it is care bookkeeping, and a handful of
-    counts should reproduce it.
+  Only SOME notes carry a "Result Type: ... *Final*" preamble. Median length
+  barely moved (3,487 -> 3,461 chars) because most notes start straight into
+  "REFERRAL SOURCE:" or "SUBJECTIVE". So the strip removes the header exactly
+  where there is one -- which is fine, those are the notes occlusion flagged
+  -- but "document type" cannot be recovered by that regex alone. 5,717 and
+  20,984 distinct values is a fallback grabbing the first sixty characters,
+  not a taxonomy.
 
-Six arms, same folds, same patients:
+  Worse, look at what a note actually opens with:
 
-  structured + proxies         the reference
-  + NOTE-TYPE COUNTS ONLY      ~30 integers, no text at all. If this
-                               reproduces the text gain, the story is over.
-  + text, raw                  what we have been reporting
-  + text, header stripped      preamble removed
-  + text, clinical only        plumbing removed too -- prose alone
-  + counts AND clinical text   does prose add anything the counts do not?
+      REASON FOR VISIT: Stage 1a right Fallopian tube carcinoma, High-grade
+      serous
 
-The last comparison is the one that decides whether there is a paper. If
-clinical-only text still beats structured+proxies+counts, the narrative
-carries something beyond which service typed it. If it does not, the honest
-finding is that note-type composition predicts progression -- a much smaller
-claim, and one a reviewer would find in an afternoon.
+That is STAGE AND HISTOLOGY, written in prose. And our structured comparator
+is labs plus a tumour marker plus order counts -- it has NO STAGE, NO GRADE,
+NO HISTOLOGY in it at all. The registry has all three and we never put them
+in. So "text adds +0.057 over structured" has been measured against a model
+missing the single most important prognostic variable in oncology. A reviewer
+would find that immediately, and they would be right to.
+
+So there are two deflationary hypotheses now, and the second is the dangerous
+one:
+
+  A. the model reads DOCUMENT TYPE and infers the care pathway
+  B. the model reads STAGE AND HISTOLOGY, which the registry already has
+
+Arms, in order of what they rule out:
+
+  structured + proxies              what we have been reporting against
+  + REGISTRY stage/grade/histology  the comparator we should have used
+  + header vocabulary               top tokens from the first 100 chars of
+                                    each note. Pure template identity, no
+                                    clinical content. Tests hypothesis A.
+  + text, raw                       as reported
+  + text, clinical prose only       header and plumbing removed
+  + everything                      does prose survive all of it?
+
+The last line is the only number that matters now.
 """
 import os
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from google.cloud import bigquery
 
+C = bigquery.Client(project="mcp-acc-055-dbg-p-7e23")
+D = "`mcp-ss-data-p-5o6i`.vw_accelerate2605_core_v1"
 rng = np.random.default_rng(0)
 REPEATS, BOOT, K = 2, 2000, 12
 COH = {
@@ -70,6 +91,42 @@ def paired(y, pa, pb, boot=BOOT):
     return (obs, *np.percentile(d, [2.5, 97.5]))
 
 
+def registry(index, tag):
+    """stage, grade, histology, laterality, nodes, and time from diagnosis.
+
+    Discovers the column names rather than assuming them -- the registry has
+    hundreds and we have guessed wrong before (HIGH_RISK_HISTOLOGIC_FEATURES
+    is a staging descriptor, blank for 313,130 of 313,442 rows)."""
+    cache = f"registry_{tag}.parquet"
+    if os.path.exists(cache):
+        return pd.read_parquet(cache).reindex(index)
+    cols = [r["column_name"] for r in C.query(
+        f"SELECT column_name FROM `mcp-ss-data-p-5o6i`."
+        f"vw_accelerate2605_core_v1.INFORMATION_SCHEMA.COLUMNS "
+        f"WHERE table_name='FACT_CANCER_DATA_REPOSITORY'").result()]
+    want = [c for c in cols if any(k in c.upper() for k in
+            ("DERIVED_SUMMARY_STAGE", "HISTOLOGIC_TYPE", "GRADE",
+             "REGIONAL_NODES_POSITIVE", "REGIONAL_NODES_EXAMINED",
+             "LATERALITY", "AGE_AT_DIAGNOSIS", "TUMOR_SIZE"))]
+    want = want[:14]
+    sel = ", ".join(f"MAX(CAST(r.{c} AS STRING)) AS {c}" for c in want)
+    ids = "','".join(index.astype(str))
+    R = C.query(f"""
+      SELECT CAST(p.PATIENT_CLINIC_NUMBER AS STRING) AS clinic, {sel},
+             MIN(DATE(r.DATE_OF_DIAGNOSIS)) AS dx_date
+      FROM {D}.FACT_CANCER_DATA_REPOSITORY r
+      JOIN {D}.DIM_PATIENT p USING (PATIENT_DK)
+      WHERE CAST(p.PATIENT_CLINIC_NUMBER AS STRING) IN ('{ids}')
+      GROUP BY 1""").to_dataframe().set_index("clinic")
+    print(f"    registry columns used: {', '.join(want)}")
+    out = pd.DataFrame(index=R.index)
+    for c in want:
+        out[c] = pd.factorize(R[c].astype(str))[0]
+    out["dx_date"] = pd.to_datetime(R["dx_date"]).astype("int64") // 86400_000_000_000
+    out.to_parquet(cache)
+    return out.reindex(index)
+
+
 for tag, (lab, mark, labs_f, marker, proxf) in COH.items():
     S_txt = f"strip_{tag}.parquet"
     if not os.path.exists(S_txt):
@@ -91,84 +148,90 @@ for tag, (lab, mark, labs_f, marker, proxf) in COH.items():
         if os.path.exists(f):
             PROX = pd.read_parquet(f).reindex(E.index).fillna(0)
             break
-    base_cols = pd.concat([S, PROX], axis=1) if PROX is not None else S
+    base = pd.concat([S, PROX], axis=1) if PROX is not None else S
+
+    print("\n" + "=" * 78)
+    print(f"{tag.upper()}   {len(E):,} patients, {int(y.sum())} events")
+    print("=" * 78)
+    REG = registry(E.index, tag)
+    REG["days_dx_to_tx"] = (E["tx_date"].astype("int64") // 86400_000_000_000
+                            - REG["dx_date"])
 
     T = pd.read_parquet(S_txt)
     T["clinic"] = T["clinic"].astype(str)
     T = T[T["clinic"].isin(E.index) & (T["rn"] <= K)]
 
-    # ---- the deflationary arm: counts of document type, no text whatsoever
-    top = T["ntype"].value_counts().head(30).index
-    CT = (T[T["ntype"].isin(top)]
-          .pivot_table(index="clinic", columns="ntype", values="rn", aggfunc="count")
-          .reindex(E.index).fillna(0))
-    CT["n_notes"] = T.groupby("clinic").size().reindex(E.index).fillna(0)
+    # ---- hypothesis A: template identity only, from the first 100 chars
+    head = T.assign(h=T["txt"].str.slice(0, 100)).groupby("clinic")["h"] \
+            .apply(lambda s: " ".join(s))
+    cvh = CountVectorizer(max_features=150, min_df=10, token_pattern=r"[A-Za-z]{3,}")
+    HV = pd.DataFrame(cvh.fit_transform(head).toarray(),
+                      index=head.index,
+                      columns=["h_" + w for w in cvh.get_feature_names_out()]
+                      ).reindex(E.index).fillna(0)
 
-    print("\n" + "=" * 78)
-    print(f"{tag.upper()}   {len(E):,} patients, {int(y.sum())} events, "
-          f"top-{K} notes, {CT.shape[1]} type-count features")
-    print("=" * 78)
-
-    arms, P = {}, {}
-    arms["structured + proxies"] = base_cols
-    arms["+ note-type COUNTS only"] = pd.concat([base_cols, CT], axis=1)
-    for col, nm in (("raw", "+ text, raw (as reported)"),
-                    ("stripped", "+ text, header stripped"),
-                    ("clinical", "+ text, clinical prose only")):
-        f = (f"rn96_emb_{tag}_512.parquet" if col == "raw"
-             else f"strip_emb_{tag}_{col}.parquet")
-        if not os.path.exists(f):
-            continue
-        V = pd.read_parquet(f)
+    def emb(fname):
+        if not os.path.exists(fname):
+            return None
+        V = pd.read_parquet(fname)
         V["clinic"] = V["clinic"].astype(str)
         V = V[V["clinic"].isin(E.index) & (V["rn"] <= K)]
         dims = [c for c in V.columns if c.isdigit()]
-        M = V.groupby("clinic")[dims].mean().reindex(E.index)
-        arms[nm] = pd.concat([base_cols, M.add_prefix("t")], axis=1)
-        if col == "clinical":
-            arms["+ counts AND clinical text"] = pd.concat(
-                [base_cols, CT, M.add_prefix("t")], axis=1)
+        return V.groupby("clinic")[dims].mean().reindex(E.index).add_prefix("t")
 
+    RAW = emb(f"rn96_emb_{tag}_512.parquet")
+    CLIN = emb(f"strip_emb_{tag}_clinical.parquet")
+
+    arms = {"structured + proxies": base,
+            "+ REGISTRY stage/grade/hist": pd.concat([base, REG], axis=1),
+            "+ header vocabulary only": pd.concat([base, REG, HV], axis=1)}
+    if RAW is not None:
+        arms["+ text, raw (as reported)"] = pd.concat([base, RAW], axis=1)
+    if CLIN is not None:
+        arms["+ text, clinical prose"] = pd.concat([base, REG, CLIN], axis=1)
+        arms["+ registry + header + prose"] = pd.concat([base, REG, HV, CLIN], axis=1)
+
+    P = {}
     for nm, X in arms.items():
         P[nm] = oof(X, y)
-        print(f"  {nm:<34}{roc_auc_score(y, P[nm]):.3f}")
+        print(f"  {nm:<34}{X.shape[1]:>6} feats   {roc_auc_score(y, P[nm]):.3f}")
 
-    ref = "structured + proxies"
-    print(f"\n  gain over {ref}:")
-    for nm in arms:
-        if nm == ref:
-            continue
-        o, lo, hi = paired(y, P[nm], P[ref])
-        print(f"    {nm:<34}{o:+.3f}  [{lo:+.3f}, {hi:+.3f}]"
-              f"{'  REAL' if lo > 0 else ''}")
+    print(f"\n  {'comparison':<52}{'diff':>8}  {'95% CI':>18}")
+    print("  " + "-" * 78)
 
-    if "+ counts AND clinical text" in P and "+ note-type COUNTS only" in P:
-        o, lo, hi = paired(y, P["+ counts AND clinical text"],
-                           P["+ note-type COUNTS only"])
-        print(f"\n  THE DECIDING TEST -- does prose add anything beyond the counts?")
-        print(f"    clinical text on top of counts   {o:+.3f}  [{lo:+.3f}, {hi:+.3f}]"
-              f"   {'SURVIVES' if lo > 0 else 'DOES NOT SURVIVE'}")
+    def show(a, b, note=""):
+        if a in P and b in P:
+            o, lo, hi = paired(y, P[a], P[b])
+            print(f"  {a[:24]+' vs '+b[:22]:<52}{o:+8.3f}  [{lo:+.3f}, {hi:+.3f}]"
+                  f"{'  REAL' if lo > 0 else ''}  {note}")
+
+    show("+ REGISTRY stage/grade/hist", "structured + proxies",
+         "<- what we omitted")
+    show("+ text, raw (as reported)", "structured + proxies",
+         "<- the reported gain")
+    show("+ header vocabulary only", "+ REGISTRY stage/grade/hist",
+         "<- hypothesis A")
+    show("+ text, clinical prose", "+ REGISTRY stage/grade/hist",
+         "<- prose over a FAIR comparator")
+    show("+ registry + header + prose", "+ header vocabulary only",
+         "<- THE DECIDING TEST")
 
 print("""
 {}
-WHAT EACH OUTCOME MEANS
+READING IT
 {}
-  counts alone reproduce the gain, prose adds nothing
-      The finding is "note-type composition predicts progression". Real, but
-      small, and derivable from metadata without any language model. The
-      narrative claim does not stand and should be withdrawn.
+  The reported +0.057 was measured against a structured model with no stage,
+  no grade and no histology. If the registry arm alone closes most of that
+  gap, the headline number was never the narrative -- it was the comparator
+  being weak. That is the finding a reviewer reaches first, and it is better
+  to find it here.
 
-  prose survives on top of counts
-      The header was a confound we have now removed, and what is left is the
-      actual claim -- stronger than before, because the obvious deflationary
-      explanation has been tested and rejected rather than ignored.
-
-  stripped text collapses but clinical text holds
-      Message plumbing was carrying it. Worth knowing exactly which part.
-
-  Either way this had to be run before anything is written down. The occlusion
-  result is not survivable by argument.""".format("=" * 78, "=" * 78))
+  The last line is the claim. Prose, added to a model that already has the
+  registry AND the note-template vocabulary, either still adds something or
+  it does not. If it does, everything deflationary has now been controlled
+  for and the result is real. If it does not, we withdraw it.""".format(
+    "=" * 78, "=" * 78))
 
 print("\n" + "-" * 74)
 print("FINAL LINE:")
-print("strip_test | see table above")
+print("strip_test | see the deciding test line per cohort")
