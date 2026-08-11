@@ -32,7 +32,7 @@ C = bigquery.Client(project="mcp-acc-055-dbg-p-7e23")
 D = "`mcp-ss-data-p-5o6i`.vw_accelerate2605_core_v1"
 rng = np.random.default_rng(0)
 
-REPEATS = 3        # OOF passes averaged, to stabilise the score vector
+REPEATS = 2        # OOF passes averaged; the bootstrap does the real work
 BOOT    = 2000     # patient resamples
 
 
