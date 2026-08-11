@@ -96,7 +96,43 @@ def poolings(V):
     num = Wv.groupby("clinic")[dims].sum()
     den = pd.Series(w.values, index=V["clinic"].values).groupby(level=0).sum()
     out["recency weighted"] = num.div(den, axis=0)
+
+    # no squashing at all: keep every note in its own block of columns,
+    # ordered by recency. 6 x 768 = 4,608 features, NaN where a patient has
+    # fewer than 6 notes -- which the GBM handles natively. Position now
+    # carries meaning: n1_* is always the note closest to treatment.
+    out["concat by recency"] = pd.concat(
+        [V[V["rn"] == k].set_index("clinic")[dims].add_prefix(f"n{k}_")
+         for k in range(1, 7)], axis=1)
+
+    # how MANY notes someone has is itself a utilisation signal, and every
+    # pooling above throws it away by construction
+    out["mean + note count"] = out["mean"].join(
+        V.groupby("clinic").size().rename("n_notes"))
     return out
+
+
+def late_fusion(V, y, dims):
+    """The other way to avoid squashing: score each NOTE, then combine the
+    SCORES rather than the vectors. One row per note, patient label copied
+    down, folds grouped so a patient's notes never straddle train and test."""
+    from sklearn.model_selection import StratifiedGroupKFold
+    Xn = V[dims].reset_index(drop=True)
+    cl = V["clinic"].values
+    yn = y.reindex(cl).values
+    keep = ~pd.isna(yn)
+    Xn, cl, yn = Xn[keep].reset_index(drop=True), cl[keep], yn[keep].astype(int)
+    pred = np.zeros(len(Xn))
+    for tr, te in StratifiedGroupKFold(5, shuffle=True,
+                                       random_state=0).split(Xn, yn, groups=cl):
+        m = HistGradientBoostingClassifier(
+            max_iter=300, learning_rate=.06, max_leaf_nodes=31,
+            min_samples_leaf=25, l2_regularization=1.,
+            random_state=0).fit(Xn.iloc[tr], yn[tr])
+        pred[te] = m.predict_proba(Xn.iloc[te])[:, 1]
+    df = pd.DataFrame({"clinic": cl, "p": pred})
+    return (df.groupby("clinic")["p"].mean().reindex(y.index),
+            df.groupby("clinic")["p"].max().reindex(y.index))
 
 
 y = E["y"]
@@ -129,6 +165,17 @@ for L in (256, 512):
         results[(L, name)] = (pt, pf, a_text, a_full)
         print(f"  {name:<20}{M.shape[1]:>6}{a_text:>12.3f}{a_full:>14.3f}")
 
+    dims = [c for c in V.columns if c.isdigit()]
+    lf_mean, lf_max = late_fusion(V, y, dims)
+    for nm, s in (("late fusion mean", lf_mean), ("late fusion max", lf_max)):
+        print(f"  {nm:<20}{'-':>6}{roc_auc_score(y, s.fillna(s.mean())):>12.3f}"
+              f"{float('nan'):>14.3f}")
+        results[(L, nm)] = (s.fillna(s.mean()).values, None,
+                            roc_auc_score(y, s.fillna(s.mean())), float("nan"))
+
+    print(f"\n  notes per patient: median {V.groupby('clinic').size().median():.0f}, "
+          f"{(V.groupby('clinic').size() == 6).mean():.0%} are at the 6-note cap")
+
 base = results.get((256, "mean"))
 if base:
     print("\n" + "=" * 78)
@@ -140,12 +187,15 @@ if base:
     for (L, name), (pt, pf, at, af) in results.items():
         if (L, name) == (256, "mean"):
             continue
+        if pt is None:
+            continue
         o, lo, hi = paired(y, pt, base[0])
         flag = "  <-- BEATS IT" if lo > 0 else ""
         print(f"  {f'{name} @ {L}':<32}{o:+8.3f}  [{lo:+.3f}, {hi:+.3f}]{flag}")
 
     if PROX is not None:
-        best = max((k for k in results), key=lambda k: results[k][3])
+        cand = [k for k in results if results[k][1] is not None]
+        best = max(cand, key=lambda k: results[k][3])
         print(f"\n  best full model: {best[1]} @ {best[0]} = {results[best][3]:.3f}")
         o, lo, hi = paired(y, results[best][1], base[1])
         print(f"  vs mean @ 256 full model:  {o:+.3f} [{lo:+.3f}, {hi:+.3f}]")
