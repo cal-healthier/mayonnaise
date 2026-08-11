@@ -1,1 +1,1 @@
-exec(open(pull("ovarian_text.py")).read())
+exec(open(pull("paired.py")).read())
