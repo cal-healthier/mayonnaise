@@ -101,13 +101,16 @@ N["passes_filter"] = (N["title"].isin(TITLES)
                       & N["txt"].str.len().between(400, 25000))
 N["used"] = N["passes_filter"] & (
     N[N["passes_filter"]].groupby("clinic")["days_before"].rank(method="first") <= 6
-).reindex(N.index).fillna(False)
+).reindex(N.index).fillna(False).astype(bool)
 
 from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained("models/pubmedbert")
 NUMS = re.compile(r"[0-9]+(\.[0-9]+)?")
-AP = re.compile(r"(?im)^\s{0,8}(assessment|impression|a\s*/\s*p|a\s*&\s*p|plan)\b"
-                r"|(?i)\bassessment\s+and\s+plan\b")
+# flags go in the flags argument, not inline: Python 3.11+ raises PatternError
+# for a (?i) that is not at the very start, and this pattern had a second one
+# after the alternation.
+AP = re.compile(r"^\s{0,8}(assessment|impression|a\s*/\s*p|a\s*&\s*p|plan)\b"
+                r"|\bassessment\s+and\s+plan\b", re.I | re.M)
 
 
 def cut_char(text, n_tok):
