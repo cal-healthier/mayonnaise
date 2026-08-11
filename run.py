@@ -1,1 +1,1 @@
-exec(open(pull("stop.py")).read())
+exec(open(pull("concept_prevalence.py")).read())
