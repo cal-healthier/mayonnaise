@@ -90,6 +90,14 @@ def sh(cmd, n=12, quiet=False, t=3600):
     return r.returncode, out
 
 
+def stop_all():
+    """defined here too, so it works after a kernel restart"""
+    for name, zone, gpu in BOXES:
+        sh(f"gcloud compute instances stop {name} --zone={zone} --project={PROJ} "
+           f"--discard-local-ssd=true --quiet 2>&1", 2, quiet=True)
+    print("  both instances stopped. billing ends.")
+
+
 print("=" * 78)
 print("STRIPPING THE METADATA HEADER")
 print("=" * 78)
@@ -174,11 +182,20 @@ ok = False
 if ip:
     SSH = f"ssh -i {KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=25 {USER}@{ip}"
     SCP = f"scp -i {KEY} -o StrictHostKeyChecking=no"
-    t0 = time.time()
+    t0, up, n = time.time(), False, 0
     while time.time() - t0 < 420:
         if sh(f"{SSH} 'echo up' 2>&1", quiet=True, t=40)[0] == 0:
+            up = True
+            print(f"  sshd answered after {time.time()-t0:.0f}s")
             break
+        n += 1
+        if n % 3 == 1:
+            print(f"  still booting ({time.time()-t0:.0f}s) ...")
         time.sleep(10)
+    if not up:
+        print("  sshd never came up -- stopping the box and giving up")
+        stop_all()
+        raise SystemExit("gpu_strip | unreachable")
     for tag in COHORTS:
         f = f"notes_gpu_strip_{tag}.parquet"
         if os.path.exists(f):
