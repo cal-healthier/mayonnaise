@@ -92,10 +92,10 @@ CONCEPTS = [
     ("interpreter",    "OPP",  r"(?i)interpreter|limited english|non.english speaking"),
 ]
 
-case = " ".join(f"WHEN r.site LIKE '{c}%' THEN '{n}'" for n, c in SITES.items())
+case = " ".join(f"WHEN site LIKE '{c}%' THEN '{n}'" for n, c in SITES.items())
 sel_note = ",\n      ".join(
     f"REGEXP_CONTAINS(t, r\"{rx}\") AS {name}" for name, _, rx in CONCEPTS)
-sel_pt = ",\n      ".join(f"MAX({name}) AS {name}" for name, _, _ in CONCEPTS)
+sel_pt = ",\n      ".join(f"LOGICAL_OR({name}) AS {name}" for name, _, _ in CONCEPTS)
 agg_pt = ",\n      ".join(
     f"AVG(CAST({name} AS INT64)) AS {name}" for name, _, _ in CONCEPTS)
 agg_note = ",\n      ".join(
