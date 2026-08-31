@@ -128,6 +128,12 @@ for tag, f in (("prostate", "strip_prostate.parquet"),
         continue
     N = pd.read_parquet(f)
     N["clinic"] = N["clinic"].astype(str)
+    # sample ~200 patients/cohort -- the per-patient regex funnel is pure
+    # Python and processing all ~6,500 takes minutes for no gain in the medians
+    cl = N["clinic"].unique()
+    rs = np.random.RandomState(0)
+    keep = set(rs.choice(cl, size=min(200, len(cl)), replace=False))
+    N = N[N["clinic"].isin(keep)]
     for clinic, g in N.groupby("clinic"):
         raw = g["txt"].str.len().sum()
         nohdr = g["stripped"].str.len().sum()
@@ -144,7 +150,7 @@ R = pd.DataFrame(rows, columns=["tag", "raw", "nohdr", "plumb", "dedup",
                                 "signal", "struct", "n_notes"])
 
 print("=" * 76)
-print(f"COMPRESSION FUNNEL   {len(R):,} patients   (cached sample, sizes are a floor)")
+print(f"COMPRESSION FUNNEL   {len(R):,} patients sampled   (sizes are a floor)")
 print("=" * 76)
 print(f"  {'stage':<22}{'median':>10}{'% of raw':>10}{'p90':>10}")
 print("  " + "-" * 54)
