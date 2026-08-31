@@ -34,7 +34,10 @@ pd.set_option("display.width", 250)
 
 SITES = {"prostate": "C61", "ovary": "C56", "breast": "C50", "lung": "C34",
          "colon": "C18", "pancreas": "C25", "brain": "C71", "melanoma": "C43"}
-case = " ".join(f"WHEN site LIKE '{c}%' THEN '{n}'" for n, c in SITES.items())
+# spell the full column expression out -- bare aliases have now bitten three
+# scripts in a row, each time surviving the syntax check and dying at dry-run
+SITECOL = "CAST(r.SITE_PRIMARY_ICD_O_3 AS STRING)"
+case = " ".join(f"WHEN {SITECOL} LIKE '{c}%' THEN '{n}'" for n, c in SITES.items())
 ECOG_RX = (r"(?i)\bECOG\b(?:\s+(?:PS|PERFORMANCE\s+STATUS))?"
            r"(?:\s+(?:OF|IS|WAS))?[\s:=-]*([0-4])\b")
 KPS_RX = (r"(?i)\b(?:KARNOFSKY(?:\s+(?:PERFORMANCE\s+)?(?:STATUS|SCORE))?|KPS)"
@@ -64,9 +67,12 @@ else:
       WHERE rn1 = 1
     ),
     pk AS (
-      SELECT reg.clinic, reg.cancer, reg.vital, reg.last_dt, pe.person_id
+      SELECT reg.clinic, ANY_VALUE(reg.cancer) AS cancer,
+             ANY_VALUE(reg.vital) AS vital, ANY_VALUE(reg.last_dt) AS last_dt,
+             MIN(pe.person_id) AS person_id
       FROM reg JOIN {D}.person pe
         ON CAST(pe.person_source_value AS STRING) = reg.clinic
+      GROUP BY 1
     ),
     hits AS (
       SELECT pk.clinic, DATE(n.note_date) AS d,
