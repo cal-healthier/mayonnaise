@@ -51,6 +51,11 @@ DRUG = re.compile(r"(?i)abiraterone|enzalutamide|apalutamide|darolutamide|doceta
                   r"doxorubicin|topotecan|bevacizumab|olaparib|niraparib|rucaparib|"
                   r"pembrolizumab|leuprolide|goserelin|degarelix|radium|lutetium|sipuleucel")
 ECOG = re.compile(r"(?i)\bECOG\b(?:\s+PS)?(?:\s+(?:of|is|was))?[\s:=-]*([0-4])\b")
+SENT = re.compile(r"(?<=[.\n;:])\s+")
+
+
+def units(t):
+    return [u.strip() for u in SENT.split(str(t)) if len(u.strip()) >= 8]
 
 
 def kb(b):
@@ -61,28 +66,24 @@ def dedup_bytes(texts):
     """keep the first occurrence of each normalized line across the record"""
     seen, kept = set(), 0
     for t in texts:
-        for ln in str(t).splitlines():
-            s = ln.strip()
-            if len(s) < 8:
-                continue
-            key = WS.sub(" ", NORM.sub("#", s.lower()))
+        for u in units(t):
+            key = WS.sub(" ", NORM.sub("#", u.lower()))
             if key not in seen:
                 seen.add(key)
-                kept += len(ln) + 1
+                kept += len(u) + 1
     return kept, seen
 
 
 def signal_bytes(texts):
     seen, kept, n = set(), 0, 0
     for t in texts:
-        for ln in str(t).splitlines():
-            s = ln.strip()
-            if len(s) < 8 or not SIGNAL.search(s):
+        for u in units(t):
+            if not SIGNAL.search(u):
                 continue
-            key = WS.sub(" ", NORM.sub("#", s.lower()))
+            key = WS.sub(" ", NORM.sub("#", u.lower()))
             if key not in seen:
                 seen.add(key)
-                kept += len(ln) + 1
+                kept += len(u) + 1
                 n += 1
     return kept, n
 
@@ -98,14 +99,13 @@ def build_case(cancer, texts):
     ecs = [int(m.group(1)) for m in ECOG.finditer(joined)]
     problems = []
     seen = set()
-    for ln in joined.splitlines():
-        s = ln.strip()
-        if 12 < len(s) < 140 and SIGNAL.search(s):
-            key = WS.sub(" ", NORM.sub("#", s.lower()))
+    for u in units(joined):
+        if 12 < len(u) < 200 and SIGNAL.search(u):
+            key = WS.sub(" ", NORM.sub("#", u.lower()))
             if key not in seen:
                 seen.add(key)
-                problems.append(s)
-        if len(problems) >= 8:
+                problems.append(u[:180])
+        if len(problems) >= 10:
             break
     case = {
         "cancer": cancer,
@@ -175,7 +175,7 @@ print(f"""
 print("=" * 76)
 print("WHERE THE BLOAT IS")
 print("=" * 76)
-r = R.median()
+r = R.drop(columns=["tag"]).median()
 print(f"  headers + plumbing:  {(1-r['plumb']/r['raw']):.0%} of raw is note")
 print(f"                       scaffolding (who typed it, when, message routing)")
 print(f"  copy-forward:        dedup removes another "
