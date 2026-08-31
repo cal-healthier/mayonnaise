@@ -1,1 +1,1 @@
-exec(open(pull("measure_bloat.py")).read())
+exec(open(pull("show_cut.py")).read())
