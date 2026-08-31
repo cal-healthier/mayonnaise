@@ -29,6 +29,7 @@ Concepts are grouped by why they are candidates:
                              judgment split we want to report
   OPPORTUNISTIC              things I noticed in the note dump
 """
+import os
 import pandas as pd
 from google.cloud import bigquery
 
@@ -153,7 +154,11 @@ print(f"  {len(CONCEPTS)} concepts x {len(SITES)} cancers, "
       f"up to {NOTES_PER_PT} most recent notes per patient")
 print(f"  scan: {job.total_bytes_processed/1e12:.2f} TB\n")
 
-R = C.query(SQL).to_dataframe()
+if os.path.exists("concept_prevalence.parquet"):
+    print("  (cached concept_prevalence.parquet -- skipping the scan)")
+    R = pd.read_parquet("concept_prevalence.parquet")
+else:
+    R = C.query(SQL).to_dataframe()
 names = [c for c, _, _ in CONCEPTS]
 group = {c: g for c, g in ((c, g) for c, g, _ in CONCEPTS)}
 
