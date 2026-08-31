@@ -1,1 +1,1 @@
-exec(open(pull("measure_footprint.py")).read())
+exec(open(pull("measure_bloat.py")).read())
