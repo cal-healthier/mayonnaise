@@ -1,1 +1,1 @@
-exec(open(pull("check_whitelist.py")).read())
+exec(open(pull("measure_footprint.py")).read())
