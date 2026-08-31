@@ -1,136 +1,147 @@
 """
-check_whitelist.py -- has the approved api.healthier.inc route gone live?
+check_whitelist.py (v2) -- distinguish a PROXY BLOCK from an ORIGIN response.
 
-Mayo approved whitelisting api.healthier.inc. This confirms whether the change
-has actually been applied to the environment's egress proxy. It is a PURE
-REACHABILITY PROBE and nothing else:
+v1 was wrong in the worst direction: it called everything REACHED, including
+download.pytorch.org, which we KNOW is blocked. The reason: this egress proxy
+answers 403 ITSELF for hosts it refuses, instead of failing the connection. So
+"got an HTTP code" does NOT mean "reached origin" here.
 
-  * no payload, no auth, no patient data -- an empty GET to "/"
-  * only the APPROVED host plus a few KNOWN controls, so the result is
-    interpretable. This is not a scan for holes; it checks one sanctioned
-    change landed.
+Two reliable tells instead:
 
-Verdicts:
-  REACHED         origin server answered (any HTTP code) -> host is whitelisted
-  BLOCKED(proxy)  the egress proxy refused before the origin -> not yet applied
-  DNS             the name did not resolve
-  BLOCKED/timeout no route / timed out -> not applied (or origin down)
+  1. TLS to the origin. If we can complete a TLS handshake and read back a
+     certificate whose names cover the host, we genuinely reached that host's
+     server. A proxy that blocks on CONNECT never lets origin TLS happen.
+  2. Proxy fingerprints on the HTTP response: Via / X-Cache / X-Squid-Error /
+     a proxy Server header, or a body that names the proxy. Those mark a
+     response MANUFACTURED BY THE PROXY, not the origin.
 
-Controls: pypi.org + api.github.com should be REACHED; download.pytorch.org
-should be BLOCKED. If the controls don't come out that way, the probe itself
-is misreading and the healthier rows can't be trusted.
+Verdict prefers the TLS signal; the HTTP headers corroborate.
+Still an empty request -- no data, no auth.
 """
-import os, shutil, subprocess
+import os, shutil, socket, ssl, subprocess
 
 HOSTS = [
-    ("pypi.org",             "control -> expect REACHED"),
-    ("api.github.com",       "control -> expect REACHED"),
-    ("download.pytorch.org", "control -> expect BLOCKED"),
+    ("pypi.org",             "control -> origin cert expected"),
+    ("api.github.com",       "control -> origin cert expected"),
+    ("download.pytorch.org", "control -> should be BLOCKED (no origin cert)"),
     ("api.healthier.inc",    "*** THE APPROVED HOST ***"),
-    ("healthier.inc",        "    (apex, in case they whitelisted this form)"),
-    ("www.healthier.inc",    "    (www, same reason)"),
+    ("healthier.inc",        "    (apex)"),
+    ("www.healthier.inc",    "    (www)"),
 ]
 
 print("=" * 74)
-print("EGRESS / PROXY CONFIG  (what the environment is set to route through)")
+print("EGRESS / PROXY CONFIG")
 print("=" * 74)
 prox = {k: v for k, v in os.environ.items() if "proxy" in k.lower()}
-if prox:
-    for k, v in sorted(prox.items()):
-        print(f"  {k} = {v}")
-else:
-    print("  (no *_proxy environment variables set -- egress may be transparent)")
-for f in ("~/.pip/pip.conf", "~/.config/pip/pip.conf", "/etc/pip.conf"):
-    p = os.path.expanduser(f)
-    if os.path.exists(p):
-        body = open(p).read().strip().replace("\n", "\n     ")
-        print(f"  {f}:\n     {body}")
-
-have_curl = shutil.which("curl")
-print(f"\n  probe tool: {'curl' if have_curl else 'urllib fallback'}")
+for k, v in sorted(prox.items()):
+    print(f"  {k} = {v}")
+if not prox:
+    print("  (no *_proxy env vars)")
 
 
-def probe_curl(host):
-    p = subprocess.run(
-        ["curl", "-sS", "-m", "12", "-o", "/dev/null",
-         "-w", "HTTP=%{http_code} IP=%{remote_ip}", f"https://{host}/"],
-        capture_output=True, text=True)
-    out, err, code = p.stdout.strip(), p.stderr.strip(), p.returncode
-    http = out.split("HTTP=")[1].split()[0] if "HTTP=" in out else "000"
-    el = err.lower()
-    if code == 6 or "could not resolve" in el or "resolve host" in el:
-        v = "DNS"
-    elif ("from proxy after connect" in el
-          or ("received http code" in el and "proxy" in el)
-          or code == 407):
-        v = "BLOCKED(proxy)"
-    elif http != "000":
-        v = "REACHED"
-    elif code in (7, 28, 35, 52, 56):
-        v = "BLOCKED/timeout"
-    else:
-        v = f"?(exit {code})"
-    detail = f"HTTP {http}" if http != "000" else (err[:70] or f"exit {code}")
-    return v, detail
+def origin_tls(host, port=443, timeout=10):
+    """Return the origin cert's names, or None if we never reached the origin.
 
-
-def probe_urllib(host):
-    import urllib.request, urllib.error
+    Uses the same proxy path everything else uses if https_proxy is set
+    (CONNECT tunnel), else a direct socket."""
+    hp = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+    raw = socket.create_connection(_hostport(hp) if hp else (host, port),
+                                   timeout=timeout)
     try:
-        r = urllib.request.urlopen(
-            urllib.request.Request(f"https://{host}/",
-                                   headers={"User-Agent": "reachability-check"}),
-            timeout=12)
-        return "REACHED", f"HTTP {r.status}"
-    except urllib.error.HTTPError as e:
-        return "REACHED", f"HTTP {e.code} from origin"
-    except Exception as e:
-        s = str(e).lower()
-        if "name or service" in s or "resolve" in s:
-            return "DNS", str(e)[:70]
-        return "BLOCKED/timeout", f"{type(e).__name__}: {str(e)[:60]}"
+        if hp:
+            raw.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
+                        .encode())
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                b = raw.recv(1024)
+                if not b:
+                    break
+                resp += b
+            line = resp.split(b"\r\n", 1)[0].decode(errors="replace")
+            if " 200 " not in line:
+                return None, f"proxy refused CONNECT: {line[:60]}"
+        ctx = ssl.create_default_context()
+        ss = ctx.wrap_socket(raw, server_hostname=host)
+        cert = ss.getpeercert()
+        names = [v for t in cert.get("subject", ()) for k, v in t if k == "commonName"]
+        names += [v for k, v in cert.get("subjectAltName", ())]
+        iss = dict(x for t in cert.get("issuer", ()) for x in t).get("organizationName", "?")
+        ss.close()
+        return names, iss
+    finally:
+        try:
+            raw.close()
+        except Exception:
+            pass
 
 
-probe = probe_curl if have_curl else probe_urllib
+def _hostport(url):
+    u = url.split("://")[-1].rstrip("/")
+    h, _, p = u.partition(":")
+    return (h, int(p) if p else 3128)
+
+
+def http_fingerprint(host):
+    if not shutil.which("curl"):
+        return "", ""
+    p = subprocess.run(["curl", "-sSI", "-m", "12", f"https://{host}/"],
+                       capture_output=True, text=True)
+    hdr = (p.stdout + p.stderr)
+    marks = [m for m in ("via:", "x-cache", "x-squid", "squid", "forcepoint",
+                         "zscaler", "bluecoat", "x-bluecoat")
+             if m in hdr.lower()]
+    server = ""
+    for ln in hdr.splitlines():
+        if ln.lower().startswith("server:"):
+            server = ln.strip()
+    return ",".join(marks), server
+
 
 print("\n" + "=" * 74)
-print("REACHABILITY  (empty GET, no data sent)")
+print("ORIGIN REACHABILITY  (TLS handshake to the host's own server)")
 print("=" * 74)
 results = {}
 for host, note in HOSTS:
-    v, detail = probe(host)
+    try:
+        names, iss = origin_tls(host)
+    except Exception as e:
+        names, iss = None, f"{type(e).__name__}: {str(e)[:50]}"
+    reached = bool(names) and any(host.split(".", 1)[-1] in n or host in n for n in (names or []))
+    marks, server = http_fingerprint(host)
+    if reached:
+        v = "REACHED"
+        detail = f"origin cert issuer={iss}"
+    else:
+        v = "BLOCKED"
+        detail = iss if isinstance(iss, str) else "no origin cert"
     results[host] = v
-    print(f"  {v:<16}{host:<22}{detail}")
-    print(f"  {'':<16}{note}")
+    print(f"  {v:<9}{host:<22}{detail}")
+    if marks:
+        print(f"  {'':<9}proxy fingerprint on HTTP: {marks}  {server}")
+    print(f"  {'':<9}{note}")
 
 ctrl_ok = (results.get("pypi.org") == "REACHED"
            and results.get("api.github.com") == "REACHED"
-           and "BLOCKED" in results.get("download.pytorch.org", ""))
-hh = [results.get(h, "?") for h in
-      ("api.healthier.inc", "healthier.inc", "www.healthier.inc")]
-live = any(x == "REACHED" for x in hh)
+           and results.get("download.pytorch.org") == "BLOCKED")
+live = results.get("api.healthier.inc") == "REACHED"
 
 print("\n" + "=" * 74)
 print("READING IT")
 print("=" * 74)
 if not ctrl_ok:
-    print("  CONTROLS DID NOT BEHAVE -- probe is misreading this environment;")
-    print("  do not trust the healthier rows. (Are we on the bastion, not the")
-    print("  GPU box? Is curl behaving? Re-run and check the control rows.)")
+    print("  Controls still off -- trust the raw cert lines above over the verdict.")
+    print(f"  (pypi={results.get('pypi.org')}, github={results.get('api.github.com')},")
+    print(f"   pytorch={results.get('download.pytorch.org')} -- pytorch MUST be BLOCKED)")
 elif live:
-    print("  api.healthier.inc (or a variant) is REACHABLE -- the whitelist is")
-    print("  LIVE. The origin answered; nothing patient-related was sent. Next:")
-    print("  a single authenticated health-check call to confirm the API responds")
-    print("  as expected, still with no patient data.")
+    print("  api.healthier.inc: real origin TLS reached -> WHITELIST IS LIVE.")
+    print("  Next: one authenticated health call, still no patient data.")
 else:
-    print("  Controls behave, but NONE of the healthier hosts are reachable --")
-    print("  the approval has NOT been applied to the proxy yet. This is a config")
-    print("  ticket on Mayo's side, not something to work around. Ask them to")
-    print("  confirm the rule is deployed and which exact hostname they added.")
+    print("  Controls correct; healthier hosts show NO origin cert -> the route is")
+    print("  NOT live yet. Approval granted != rule deployed. Ask Mayo to confirm")
+    print("  the allowlist entry shipped and the exact hostname. Do not work around.")
 
 print("\n" + "-" * 70)
 print("FINAL LINE:")
-print(f"check_whitelist | controls_ok={ctrl_ok} | "
-      f"api={results.get('api.healthier.inc')} "
-      f"apex={results.get('healthier.inc')} www={results.get('www.healthier.inc')} "
-      f"| live={live}")
+print(f"check_whitelist_v2 | controls_ok={ctrl_ok} | "
+      f"api={results.get('api.healthier.inc')} apex={results.get('healthier.inc')} "
+      f"www={results.get('www.healthier.inc')} | live={live}")
