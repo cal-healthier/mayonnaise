@@ -76,7 +76,7 @@ def prog_dates(tag):
     return P
 
 
-def pull(tag, P):
+def med_events(tag, P):
     case = "\n      ".join(
         f"WHEN REGEXP_CONTAINS(o.med, r'{rx}') THEN '{name}'"
         for name, rx in CLASSES[tag])
@@ -118,6 +118,17 @@ def pull(tag, P):
     return C.query(sql).to_dataframe()
 
 
+def med_events_cached(tag, P):
+    import os
+    cache = f"nl_{tag}.parquet"
+    if os.path.exists(cache):
+        print("  (cached)")
+        return pd.read_parquet(cache)
+    G = med_events(tag, P)
+    G.to_parquet(cache)
+    return G
+
+
 def death(P):
     ids = "','".join(P.index.astype(str))
     R = C.query(f"""
@@ -140,7 +151,7 @@ for tag in ("prostate", "ovarian"):
           f"{int(P['pd'].dt.year.median())} (IQR {int(P['pd'].dt.year.quantile(.25))}-"
           f"{int(P['pd'].dt.year.quantile(.75))})")
     print("=" * 78)
-    G = pull(tag, P)
+    G = med_events_cached(tag, P)
     G["clinic"] = G["clinic"].astype(str)
     for c in ("first_after", "last_after", "last_before"):
         G[c] = pd.to_datetime(G[c].astype("datetime64[ns]"))
