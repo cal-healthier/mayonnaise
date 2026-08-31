@@ -1,1 +1,1 @@
-exec(open(pull("show_cut.py")).read())
+exec(open(pull("strip_junk.py")).read())
