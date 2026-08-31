@@ -1,147 +1,102 @@
 """
-check_whitelist.py (v2) -- distinguish a PROXY BLOCK from an ORIGIN response.
+check_whitelist.py (v3) -- content check, the only test a MITM proxy can't fake.
 
-v1 was wrong in the worst direction: it called everything REACHED, including
-download.pytorch.org, which we KNOW is blocked. The reason: this egress proxy
-answers 403 ITSELF for hosts it refuses, instead of failing the connection. So
-"got an HTTP code" does NOT mean "reached origin" here.
+v1 and v2 both failed for the same reason: this environment does TLS
+INTERCEPTION. Every host -- including known-blocked download.pytorch.org --
+handed back a certificate issued by "Cloud Services", not the real origin CA.
+So the proxy terminates TLS, inspects, and re-originates; neither "got an HTTP
+code" (v1) nor "got an origin cert" (v2) means we reached the real host.
 
-Two reliable tells instead:
+What a re-encrypting proxy CANNOT fake is upstream CONTENT. An allowed host is
+forwarded and the proxy hands back the ORIGIN's real response body/headers. A
+blocked host gets the proxy's own canned denial -- there is no upstream content
+behind it. So compare bodies:
 
-  1. TLS to the origin. If we can complete a TLS handshake and read back a
-     certificate whose names cover the host, we genuinely reached that host's
-     server. A proxy that blocks on CONNECT never lets origin TLS happen.
-  2. Proxy fingerprints on the HTTP response: Via / X-Cache / X-Squid-Error /
-     a proxy Server header, or a body that names the proxy. Those mark a
-     response MANUFACTURED BY THE PROXY, not the origin.
+  known-allowed  api.github.com/zen  -> a real one-line sentence from GitHub
+  the question   api.healthier.inc   -> your API's real output, or a proxy
+                                         block page
 
-Verdict prefers the TLS signal; the HTTP headers corroborate.
-Still an empty request -- no data, no auth.
+The script prints the raw first bytes + telltale headers for each so you can
+judge with your own eyes. It does NOT auto-verdict the healthier rows, because
+auto-verdict is exactly what went wrong twice. It flags obvious proxy
+signatures if present. Empty GET, no data, no auth.
 """
-import os, shutil, socket, ssl, subprocess
+import shutil, subprocess
 
-HOSTS = [
-    ("pypi.org",             "control -> origin cert expected"),
-    ("api.github.com",       "control -> origin cert expected"),
-    ("download.pytorch.org", "control -> should be BLOCKED (no origin cert)"),
-    ("api.healthier.inc",    "*** THE APPROVED HOST ***"),
-    ("healthier.inc",        "    (apex)"),
-    ("www.healthier.inc",    "    (www)"),
+# (host, path, what a REAL forwarded response looks like)
+TESTS = [
+    ("api.github.com", "/zen",       "one plain-English sentence (GitHub zen)"),
+    ("api.github.com", "/",          "real JSON with current_user_url etc."),
+    ("download.pytorch.org", "/",    "KNOWN BLOCKED -> this is what a denial looks like"),
+    ("api.healthier.inc", "/",       "*** your API root ***"),
+    ("api.healthier.inc", "/health", "*** your health endpoint, if any ***"),
+    ("healthier.inc", "/",           "apex"),
 ]
 
+PROXY_MARKERS = ("access denied", "access to the requested", "blocked", "forbidden by",
+                 "squid", "zscaler", "forcepoint", "bluecoat", "proxy",
+                 "not permitted", "policy", "x-squid-error", "x-cache", "via:")
+
+if not shutil.which("curl"):
+    print("curl not found -- cannot run the content check on this box")
+    raise SystemExit
+
 print("=" * 74)
-print("EGRESS / PROXY CONFIG")
+print("CONTENT CHECK  (a re-encrypting proxy can fake the cert, not the body)")
 print("=" * 74)
-prox = {k: v for k, v in os.environ.items() if "proxy" in k.lower()}
-for k, v in sorted(prox.items()):
-    print(f"  {k} = {v}")
-if not prox:
-    print("  (no *_proxy env vars)")
 
-
-def origin_tls(host, port=443, timeout=10):
-    """Return the origin cert's names, or None if we never reached the origin.
-
-    Uses the same proxy path everything else uses if https_proxy is set
-    (CONNECT tunnel), else a direct socket."""
-    hp = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
-    raw = socket.create_connection(_hostport(hp) if hp else (host, port),
-                                   timeout=timeout)
-    try:
-        if hp:
-            raw.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
-                        .encode())
-            resp = b""
-            while b"\r\n\r\n" not in resp:
-                b = raw.recv(1024)
-                if not b:
-                    break
-                resp += b
-            line = resp.split(b"\r\n", 1)[0].decode(errors="replace")
-            if " 200 " not in line:
-                return None, f"proxy refused CONNECT: {line[:60]}"
-        ctx = ssl.create_default_context()
-        ss = ctx.wrap_socket(raw, server_hostname=host)
-        cert = ss.getpeercert()
-        names = [v for t in cert.get("subject", ()) for k, v in t if k == "commonName"]
-        names += [v for k, v in cert.get("subjectAltName", ())]
-        iss = dict(x for t in cert.get("issuer", ()) for x in t).get("organizationName", "?")
-        ss.close()
-        return names, iss
-    finally:
-        try:
-            raw.close()
-        except Exception:
-            pass
-
-
-def _hostport(url):
-    u = url.split("://")[-1].rstrip("/")
-    h, _, p = u.partition(":")
-    return (h, int(p) if p else 3128)
-
-
-def http_fingerprint(host):
-    if not shutil.which("curl"):
-        return "", ""
-    p = subprocess.run(["curl", "-sSI", "-m", "12", f"https://{host}/"],
+for host, path, expect in TESTS:
+    url = f"https://{host}{path}"
+    # -i include headers; -s silent; -m timeout; cap the body ourselves
+    p = subprocess.run(["curl", "-sSi", "-m", "12", url],
                        capture_output=True, text=True)
-    hdr = (p.stdout + p.stderr)
-    marks = [m for m in ("via:", "x-cache", "x-squid", "squid", "forcepoint",
-                         "zscaler", "bluecoat", "x-bluecoat")
-             if m in hdr.lower()]
-    server = ""
-    for ln in hdr.splitlines():
-        if ln.lower().startswith("server:"):
-            server = ln.strip()
-    return ",".join(marks), server
+    raw = (p.stdout or "")
+    err = (p.stderr or "").strip()
+    head, _, body = raw.partition("\r\n\r\n")
+    if not body:
+        head, _, body = raw.partition("\n\n")
+    status = head.split("\n", 1)[0].strip() if head else "(no status line)"
+    server = next((l.strip() for l in head.splitlines() if l.lower().startswith("server:")), "")
+    via    = next((l.strip() for l in head.splitlines() if l.lower().startswith("via:")), "")
+    xcache = next((l.strip() for l in head.splitlines()
+                   if l.lower().startswith(("x-cache", "x-squid", "x-bluecoat"))), "")
+    body1  = " ".join(body.split())[:160]
+    low    = (head + " " + body).lower()
+    flags  = [m for m in PROXY_MARKERS if m in low]
 
+    print(f"\n  {url}")
+    print(f"    expect: {expect}")
+    print(f"    status: {status or err[:70]}")
+    if server: print(f"    {server}")
+    if via:    print(f"    {via}")
+    if xcache: print(f"    {xcache}")
+    print(f"    body[:160]: {body1 or '(empty)'}")
+    if flags:
+        print(f"    >> proxy-denial signatures present: {flags}")
 
-print("\n" + "=" * 74)
-print("ORIGIN REACHABILITY  (TLS handshake to the host's own server)")
-print("=" * 74)
-results = {}
-for host, note in HOSTS:
-    try:
-        names, iss = origin_tls(host)
-    except Exception as e:
-        names, iss = None, f"{type(e).__name__}: {str(e)[:50]}"
-    reached = bool(names) and any(host.split(".", 1)[-1] in n or host in n for n in (names or []))
-    marks, server = http_fingerprint(host)
-    if reached:
-        v = "REACHED"
-        detail = f"origin cert issuer={iss}"
-    else:
-        v = "BLOCKED"
-        detail = iss if isinstance(iss, str) else "no origin cert"
-    results[host] = v
-    print(f"  {v:<9}{host:<22}{detail}")
-    if marks:
-        print(f"  {'':<9}proxy fingerprint on HTTP: {marks}  {server}")
-    print(f"  {'':<9}{note}")
+print("""
+{}
+HOW TO READ IT -- with your eyes, not my classifier
+{}
+  Compare the two api.github.com rows against the healthier rows.
 
-ctrl_ok = (results.get("pypi.org") == "REACHED"
-           and results.get("api.github.com") == "REACHED"
-           and results.get("download.pytorch.org") == "BLOCKED")
-live = results.get("api.healthier.inc") == "REACHED"
+  github /zen returns a real sentence and github / returns real JSON: that is
+  what a FORWARDED (allowed) request looks like on this proxy -- genuine origin
+  content coming back.
 
-print("\n" + "=" * 74)
-print("READING IT")
-print("=" * 74)
-if not ctrl_ok:
-    print("  Controls still off -- trust the raw cert lines above over the verdict.")
-    print(f"  (pypi={results.get('pypi.org')}, github={results.get('api.github.com')},")
-    print(f"   pytorch={results.get('download.pytorch.org')} -- pytorch MUST be BLOCKED)")
-elif live:
-    print("  api.healthier.inc: real origin TLS reached -> WHITELIST IS LIVE.")
-    print("  Next: one authenticated health call, still no patient data.")
-else:
-    print("  Controls correct; healthier hosts show NO origin cert -> the route is")
-    print("  NOT live yet. Approval granted != rule deployed. Ask Mayo to confirm")
-    print("  the allowlist entry shipped and the exact hostname. Do not work around.")
+  download.pytorch.org is the known-blocked reference: whatever its body and
+  headers look like IS the proxy's denial fingerprint on this environment.
+
+  Then judge healthier:
+    * body looks like YOUR API (your JSON, your error shape, even a 404 you
+      recognise) -> WHITELISTED, request is being forwarded.
+    * body matches the pytorch denial / shows proxy signatures -> NOT live;
+      the proxy is answering for it. Approval granted != rule deployed. Ask
+      Mayo to confirm the allowlist entry shipped and the exact hostname.
+
+  You know your own API's real output; that recognition is the reliable test
+  the two automated probes could not make.""".format("=" * 74, "=" * 74))
 
 print("\n" + "-" * 70)
 print("FINAL LINE:")
-print(f"check_whitelist_v2 | controls_ok={ctrl_ok} | "
-      f"api={results.get('api.healthier.inc')} apex={results.get('healthier.inc')} "
-      f"www={results.get('www.healthier.inc')} | live={live}")
+print("check_whitelist_v3 | compare github (allowed) vs pytorch (blocked) vs healthier by BODY")
