@@ -222,3 +222,33 @@ print("FINAL LINE:")
 print(f"bloat | raw_kb={base/1024:.0f} | signal_kb={R['signal'].median()/1024:.1f} "
       f"| struct_kb={R['struct'].median()/1024:.1f} "
       f"| reduction={base/R['struct'].median():.0f}x")
+
+# ---- true-fidelity dedup on the UNCAPPED full-text sample (10 patients) ----
+# strip_*.parquet caps notes at 4000 chars and a short window, which hides
+# copy-forward. inspect_ovarian_0.parquet has COMPLETE note text, so it shows
+# the real redundancy rate.
+import glob as _glob
+insp = _glob.glob("inspect_*_0.parquet")
+if insp:
+    print("\n" + "=" * 76)
+    print("TRUE-FIDELITY DEDUP  (uncapped full note text, small sample)")
+    print("=" * 76)
+    for f in insp[:1]:
+        Z = pd.read_parquet(f)
+        Z["clinic"] = Z["clinic"].astype(str)
+        raws, dds, uniq_sent, tot_sent = [], [], 0, 0
+        for clinic, g in Z.groupby("clinic"):
+            raw = g["txt"].str.len().sum()
+            dd, seen = dedup_bytes(g["txt"])
+            allu = sum(len(units(t)) for t in g["txt"])
+            raws.append(raw); dds.append(dd)
+            uniq_sent += len(seen); tot_sent += allu
+        raws, dds = np.array(raws), np.array(dds)
+        print(f"  {f}: {Z['clinic'].nunique()} patients, "
+              f"median {Z.groupby('clinic').size().median():.0f} notes each")
+        print(f"  raw median: {raws.mean()/1024:.0f} KB/patient")
+        print(f"  after sentence-dedup: {dds.mean()/1024:.0f} KB "
+              f"({dds.mean()/raws.mean():.0%} kept)")
+        print(f"  unique sentences: {uniq_sent:,} of {tot_sent:,} "
+              f"({uniq_sent/max(tot_sent,1):.0%}) -- the rest is copy-forward")
+
