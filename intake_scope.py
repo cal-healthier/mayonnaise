@@ -39,6 +39,9 @@ WIN = 120
 
 ELEMENTS = [
     ("stage_tnm",   r"(?i)\bstage\s+(0|I{1,3}V?|IV|[1-4])[ABC]?\b|\b(?:y?p|c)?T[0-4][a-cx]?\s?N[0-3X]\s?M[01X]\b"),
+    ("extent_alt",  r"(?i)gleason\s+[0-9]|grade group|risk (group|category|stratif)|"
+                    r"biochemical recurrence|castrat|\bmCRPC\b|\bM1[abc]?\b|"
+                    r"metastatic|locally advanced|organ.confined"),
     ("histo_path",  r"(?i)adenocarcinoma|carcinoma|sarcoma|histolog|biops|patholog|gleason"),
     ("imaging",     r"(?i)\b(CT|MRI|PET|ultrasound|bone scan)\b"),
     ("img_read",    r"(?i)impression|no evidence of|interval (increase|decrease|change)|metastat"),
@@ -157,7 +160,14 @@ core_p = (P_["stage_tnm"] & P_["histo_path"] & P_["imaging"]
           & (P_["prior_tx"] | P_["onc_history"]))
 core_o = (O_["stage_tnm"] & O_["histo_path"] & O_["imaging"]
           & (O_["prior_tx"] | O_["onc_history"]))
-print(f"\n  {'RUNNABLE (core four)':<26}{core_p.mean():>12.0%}{core_o.mean():>12.0%}")
+# relaxed: stage OR any disease-extent vocabulary (risk group, recurrence,
+# metastatic) -- prostate writes extent without the word "stage"
+rel_p = ((P_["stage_tnm"] | P_["extent_alt"]) & P_["histo_path"] & P_["imaging"]
+         & (P_["prior_tx"] | P_["onc_history"]))
+rel_o = ((O_["stage_tnm"] | O_["extent_alt"]) & O_["histo_path"] & O_["imaging"]
+         & (O_["prior_tx"] | O_["onc_history"]))
+print(f"\n  {'RUNNABLE (strict stage)':<26}{core_p.mean():>12.0%}{core_o.mean():>12.0%}")
+print(f"  {'RUNNABLE (any extent)':<26}{rel_p.mean():>12.0%}{rel_o.mean():>12.0%}")
 print(f"  (of the whole cohort:     "
       f"{core_p.sum()/max(tot['prostate'],1):>11.0%}{core_o.sum()/max(tot['ovarian'],1):>12.0%})")
 
