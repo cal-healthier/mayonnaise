@@ -1,1 +1,1 @@
-exec(open(pull("scenario_census.py")).read())
+exec(open(pull("boussard_brief.py")).read())
