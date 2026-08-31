@@ -1,1 +1,1 @@
-exec(open(pull("boussard_brief.py")).read())
+exec(open(pull("check_whitelist.py")).read())
