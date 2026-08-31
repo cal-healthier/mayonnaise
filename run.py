@@ -1,1 +1,1 @@
-exec(open(pull("intake_scope.py")).read())
+exec(open(pull("scenario_census.py")).read())
