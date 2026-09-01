@@ -1,1 +1,1 @@
-exec(open(pull("measure_gzip.py")).read())
+exec(open(pull("full_gzip.py")).read())
