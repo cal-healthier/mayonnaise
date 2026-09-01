@@ -16,6 +16,7 @@ from google.cloud import bigquery
 
 C = bigquery.Client(project="mcp-acc-055-dbg-p-7e23")
 D = "`mcp-ss-data-p-5o6i`.vw_accelerate2605_core_v1"
+CUT = 2021   # recency cutoff year
 
 cache = "recency.parquet"
 if os.path.exists(cache):
@@ -71,28 +72,28 @@ print("=" * 66)
 for label, col in [("DIAGNOSED (dx year)", "dx_yr"),
                    ("FIRST SEEN AT MAYO (first note year)", "fn_yr")]:
     print(f"\n  {label}")
-    for lo, hi, name in [(0, 2010, "before 2010"), (2010, 2017, "2010-2016"),
-                         (2017, 2100, "2017 onward")]:
+    for lo, hi, name in [(0, 2015, "before 2015"), (2015, CUT, f"2015-{CUT-1}"),
+                         (CUT, 2100, f"{CUT} onward")]:
         m = ((R[col] >= lo) & (R[col] < hi)).sum()
         print(f"    {name:<16}{m:>9,}  ({m/N:.0%})")
     valid = R[col].notna().sum()
-    ge = (R[col] >= 2017).sum()
-    print(f"    -> 2017+: {ge:,} of {N:,} = {ge/N:.0%} of all "
+    ge = (R[col] >= CUT).sum()
+    print(f"    -> {CUT}+: {ge:,} of {N:,} = {ge/N:.0%} of all "
           f"(or {ge/max(valid,1):.0%} of those with a date)")
 
-both = ((R["dx_yr"] >= 2017) | (R["fn_yr"] >= 2017)).sum()
-strict = ((R["fn_yr"] >= 2017)).sum()
+both = ((R["dx_yr"] >= CUT) | (R["fn_yr"] >= CUT)).sum()
+strict = ((R["fn_yr"] >= CUT)).sum()
+dxc = (R["dx_yr"] >= CUT).sum()
 print("\n" + "=" * 66)
-print("DOES 2017+ SIGNIFICANTLY CUT THE COHORT?")
+print(f"DOES {CUT}+ SIGNIFICANTLY CUT THE COHORT?")
 print("=" * 66)
 print(f"  full cohort                              {N:,}   100%")
-print(f"  first seen at Mayo 2017+                 {strict:,}   {strict/N:.0%}")
-print(f"  diagnosed 2017+                          {(R['dx_yr']>=2017).sum():,}   "
-      f"{(R['dx_yr']>=2017).sum()/N:.0%}")
-print(f"  diagnosed OR first seen 2017+            {both:,}   {both/N:.0%}")
+print(f"  first seen at Mayo {CUT}+                 {strict:,}   {strict/N:.0%}")
+print(f"  diagnosed {CUT}+                          {dxc:,}   {dxc/N:.0%}")
+print(f"  diagnosed OR first seen {CUT}+            {both:,}   {both/N:.0%}")
 
 print(f"""
-  "First seen at Mayo 2017+" keeps ~{strict/N:.0%} of the registry. Whether that
+  "First seen at Mayo {CUT}+" keeps ~{strict/N:.0%} of the registry. Whether that
   is "significant" is your call, but note the caveat above: first-note year is
   bounded by when the note data itself begins, so a low count can mean the EHR
   record starts later, not that the patient arrived later. If the date-sanity
@@ -100,5 +101,5 @@ print(f"""
 
 print("\n" + "-" * 60)
 print("FINAL LINE:")
-print(f"recency | cohort={N} | first_seen_2017+={strict}({strict/N:.0%}) "
-      f"| dx_2017+={(R['dx_yr']>=2017).sum()}({(R['dx_yr']>=2017).sum()/N:.0%})")
+print(f"recency | cut={CUT} | cohort={N} | first_seen={strict}({strict/N:.0%}) "
+      f"| diagnosed={dxc}({dxc/N:.0%})")
