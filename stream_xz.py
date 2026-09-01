@@ -59,7 +59,7 @@ capped AS (
   WHERE n.note_text IS NOT NULL
   QUALIFY ROW_NUMBER() OVER (PARTITION BY pk.clinic
                              ORDER BY n.note_date DESC) <= {MAX_NOTES})
-SELECT clinic, STRING_AGG(txt, '\\n') AS full
+SELECT clinic, STRING_AGG(txt, '\\n') AS alltext
 FROM capped GROUP BY clinic
 """
 
@@ -95,7 +95,7 @@ with Pool(NPROC) as pool:
                   flush=True)
 
     for row in rows:
-        batch.append((row.clinic, row.full))
+        batch.append((row.clinic, row.alltext))
         if len(batch) >= BATCH:
             flush(); batch = []
     if batch:
