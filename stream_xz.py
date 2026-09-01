@@ -35,6 +35,10 @@ def compress_one(args):
     return len(b), len(xz)
 
 
+MAX_NOTES = 400   # cap notes/patient BEFORE aggregating so STRING_AGG never
+                  # builds an oversized value (heavy patients hit BQ limits).
+                  # median is 257 so most patients are kept whole; heaviest
+                  # keep their 400 most-recent notes. Stated in the output.
 sql = f"""
 WITH coh AS (
   SELECT PATIENT_DK FROM (
@@ -48,13 +52,15 @@ pk AS (
          pe.person_id
   FROM coh c JOIN {D}.DIM_PATIENT p USING (PATIENT_DK)
   JOIN {D}.person pe ON CAST(pe.person_source_value AS STRING)
-                      = CAST(p.PATIENT_CLINIC_NUMBER AS STRING))
-SELECT pk.clinic,
-       SUBSTR(STRING_AGG(SUBSTR(CAST(n.note_text AS STRING), 1, 50000), '\\n'
-              ORDER BY n.note_date), 1, 10000000) AS full
-FROM pk JOIN {D}.note n ON n.person_id = pk.person_id
-WHERE n.note_text IS NOT NULL
-GROUP BY pk.clinic
+                      = CAST(p.PATIENT_CLINIC_NUMBER AS STRING)),
+capped AS (
+  SELECT pk.clinic, SUBSTR(CAST(n.note_text AS STRING), 1, 50000) AS txt
+  FROM pk JOIN {D}.note n ON n.person_id = pk.person_id
+  WHERE n.note_text IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY pk.clinic
+                             ORDER BY n.note_date DESC) <= {MAX_NOTES})
+SELECT clinic, STRING_AGG(txt, '\\n') AS full
+FROM capped GROUP BY clinic
 """
 
 job = C.query(sql, job_config=bigquery.QueryJobConfig(dry_run=True))
@@ -65,7 +71,11 @@ print(f"output -> {OUT}/  (sharded by clinic prefix)")
 print("=" * 70, flush=True)
 
 t0 = time.time()
-rows = C.query(sql).result(page_size=500)
+try:
+    rows = C.query(sql).result(page_size=200)
+except Exception as e:
+    print("QUERY FAILED:\n" + str(e)[:800])
+    raise
 batch, n, raw_tot, xz_tot, first = [], 0, 0, 0, True
 with Pool(NPROC) as pool:
     def flush():
