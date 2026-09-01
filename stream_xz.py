@@ -17,7 +17,8 @@ from google.cloud import bigquery
 C = bigquery.Client(project="mcp-acc-055-dbg-p-7e23")
 D = "`mcp-ss-data-p-5o6i`.vw_accelerate2605_core_v1"
 CUT = 2021
-OUT = "modern_cohort"
+SAMPLE_N = 5000        # random sample of the cohort; set None for all ~84k
+OUT = "modern_cohort_5k"
 PRESET = 6                 # xz level; drop to 1-2 if too slow
 BATCH = 1500
 NPROC = max(1, cpu_count() - 1)
@@ -45,7 +46,8 @@ WITH coh AS (
     SELECT PATIENT_DK, MIN(DATE(DATE_OF_DIAGNOSIS)) AS dx
     FROM {D}.FACT_CANCER_DATA_REPOSITORY
     WHERE DATE_OF_DIAGNOSIS IS NOT NULL GROUP BY 1)
-  WHERE EXTRACT(YEAR FROM dx) >= {CUT}),
+  WHERE EXTRACT(YEAR FROM dx) >= {CUT}
+  {"ORDER BY RAND() LIMIT %d" % SAMPLE_N if SAMPLE_N else ""}),
 pk AS (
   SELECT DISTINCT c.PATIENT_DK,
          CAST(p.PATIENT_CLINIC_NUMBER AS STRING) AS clinic,
@@ -88,7 +90,7 @@ with Pool(NPROC) as pool:
               f"| {el/60:>5.1f} min | {rate:>5.0f} pt/s", flush=True)
         if first:
             first = False
-            est_total = 84000
+            est_total = SAMPLE_N or 84000
             eta = (est_total - n) / max(rate, 1) / 60
             print(f"  >>> ETA for ~84k patients: ~{eta:.0f} more minutes "
                   f"(kill now if that is too long; lower PRESET or check cores)",
@@ -109,6 +111,11 @@ print(f"  raw total       {raw_tot/1e9:.1f} GB")
 print(f"  xz total        {xz_tot/1e9:.2f} GB   ({raw_tot/max(xz_tot,1):.1f}x)")
 print(f"  mean xz/patient {xz_tot/max(n,1)/1024:.0f} KB")
 print(f"  files in        {OUT}/  ({n:,} .xz files, sharded)")
+if SAMPLE_N:
+    full = 84000
+    print(f"\n  EXTRAPOLATED to full ~{full:,}-patient cohort:")
+    print(f"    xz total ~= {xz_tot/max(n,1)*full/1e9:.1f} GB   "
+          f"raw ~= {raw_tot/max(n,1)*full/1e9:.0f} GB")
 print("\n" + "-" * 60)
 print("FINAL LINE:")
 print(f"stream_xz | patients={n} | raw_gb={raw_tot/1e9:.1f} | xz_gb={xz_tot/1e9:.2f} "
