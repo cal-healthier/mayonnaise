@@ -1,1 +1,1 @@
-exec(open(pull("profile_content.py")).read())
+exec(open(pull("measure_gzip.py")).read())
